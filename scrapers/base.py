@@ -28,14 +28,13 @@ class Annonce:
         return hashlib.sha256(self.url.encode()).hexdigest()[:16]
     def to_airtable(self) -> dict:
                 return {
-                                "url_annonce": self.url,
+                                "url": self.url,
                                 "titre": self.titre[:255],
-                                "source_nom": self.source_nom,
+                                "source": self.source_nom,
                                 "pays": self.pays,
-                                "description": (self.type_vente + " " + self.description).strip()[:500],
-                                "date_scrappe": self.date_scrappe,
-                                "statut": "Nouveau",
-                                "vue": False,
+                                "description": self.description[:500],
+                                "prix": self.prix,
+                                                "type_vente": self.type_vente,
                 }
         
 
