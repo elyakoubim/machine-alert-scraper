@@ -21,6 +21,7 @@ class Annonce:
     type_vente: str = ""
     description: str = ""
     prix: str = ""
+    image_url: str = ""
     date_scrappe: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @property
@@ -35,6 +36,7 @@ class Annonce:
                                 "description": self.description[:500],
                                 "prix": self.prix,
                                                 "type_vente": self.type_vente,
+                    "image_url": self.image_url,
                 }
         
 
