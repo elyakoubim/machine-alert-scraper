@@ -31,31 +31,21 @@ from scrapers.base import Annonce
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Configuration depuis l'environnement
-# =============================================================================
-
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
 BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appQrNOm3Q7D9uEed")
-
-# IDs réels des tables (vérifiés le 2026-04-24 via inspection directe)
 ANNONCES_TABLE = os.getenv("AIRTABLE_ANNONCES_TABLE", "tbljV9HICBsPyqjQk")
 SOURCES_TABLE = os.getenv("AIRTABLE_SOURCES_TABLE", "tblPaOrQekEMdaW5x")
 PROFILS_TABLE = os.getenv("AIRTABLE_PROFILS_TABLE", "tblXhuS0M1TtRuSel")
 
 API_BASE = f"https://api.airtable.com/v0/{BASE_ID}"
-
-# Timeout des requêtes HTTP
 HTTP_TIMEOUT = 20.0
 
 
 def _headers() -> dict:
-    """Construit les headers avec le token courant (lu à chaque appel
-    pour supporter un changement de token sans redémarrer le process)."""
     token = os.getenv("AIRTABLE_TOKEN") or AIRTABLE_TOKEN
     if not token:
         raise RuntimeError(
-            "airtable : AIRTABLE_TOKEN absent. Définis-le dans Railway "
+            "airtable : AIRTABLE_TOKEN absent. Definis-le dans Railway "
             "Variables ou en local via .env."
         )
     return {
@@ -64,20 +54,10 @@ def _headers() -> dict:
     }
 
 
-# =============================================================================
-# Lecture : déduplication
-# =============================================================================
-
-def get_existing_urls(source_nom: str) -> set[str]:
-    """Récupère toutes les URLs déjà en base pour une source donnée.
-
-    Sert à éviter de re-créer des records qui existent déjà.
-    Attention : pagination Airtable par 100 max, on itère jusqu'à épuisement.
-    """
-    urls: set[str] = set()
-    offset: Optional[str] = None
+def get_existing_urls(source_nom: str) -> set:
+    urls = set()
+    offset = None
     page = 0
-
     while True:
         page += 1
         params = {
@@ -87,7 +67,6 @@ def get_existing_urls(source_nom: str) -> set[str]:
         }
         if offset:
             params["offset"] = offset
-
         try:
             resp = requests.get(
                 f"{API_BASE}/{ANNONCES_TABLE}",
@@ -97,55 +76,30 @@ def get_existing_urls(source_nom: str) -> set[str]:
             )
             resp.raise_for_status()
         except requests.RequestException as e:
-            logger.error(
-                "[airtable] get_existing_urls(%s) page %d : %s",
-                source_nom, page, e,
-            )
+            logger.error("[airtable] get_existing_urls(%s) page %d : %s", source_nom, page, e)
             break
-
         data = resp.json()
         for record in data.get("records", []):
             url = record.get("fields", {}).get("url", "")
             if url:
                 urls.add(url)
-
         offset = data.get("offset")
         if not offset:
             break
-
-        # Rate limit sécurité (5 req/sec)
         time.sleep(0.25)
-
-    logger.info("[airtable] %d URLs existantes chargées pour %s", len(urls), source_nom)
+    logger.info("[airtable] %d URLs existantes chargees pour %s", len(urls), source_nom)
     return urls
 
 
-# =============================================================================
-# Écriture : push des annonces
-# =============================================================================
-
-def push_annonces(annonces: Iterable[Annonce], source_nom: str) -> dict:
-    """Pousse une liste d'annonces vers Airtable, en évitant les doublons.
-
-    Flow :
-        1. Charge les URLs déjà en base pour cette source (dédup)
-        2. Filtre les nouvelles annonces
-        3. Push par batches de 10 (limite Airtable)
-        4. Retry une fois en cas d'erreur réseau
-
-    Returns :
-        { "pushed": int, "skipped": int, "errors": int, "total": int }
-    """
+def push_annonces(annonces: Iterable, source_nom: str) -> dict:
     annonces = list(annonces)
     total = len(annonces)
     if total == 0:
         return {"pushed": 0, "skipped": 0, "errors": 0, "total": 0}
 
     existing = get_existing_urls(source_nom)
-
-    # Filtrer : pas dans existing, pas en double dans le batch courant
-    seen_in_batch: set[str] = set()
-    new_annonces: list[Annonce] = []
+    seen_in_batch = set()
+    new_annonces = []
     for a in annonces:
         if a.url in existing:
             continue
@@ -156,20 +110,174 @@ def push_annonces(annonces: Iterable[Annonce], source_nom: str) -> dict:
 
     skipped = total - len(new_annonces)
     logger.info(
-        "[%s] %d nouvelles annonces à pousser, %d doublons ignorés",
+        "[%s] %d nouvelles annonces a pousser, %d doublons ignores",
         source_nom, len(new_annonces), skipped,
     )
 
-    # Push par batches de 10
     pushed = 0
     errors = 0
     for i in range(0, len(new_annonces), 10):
         batch = new_annonces[i:i + 10]
         records = [{"fields": a.to_airtable()} for a in batch]
-
         try:
             resp = _post_records_with_retry(records)
             if resp.status_code == 200:
                 pushed += len(batch)
-                logger.debug(
-                    "[%s] bat
+            else:
+                errors += len(batch)
+                logger.error("[%s] Airtable HTTP %d : %s", source_nom, resp.status_code, resp.text[:300])
+        except requests.RequestException as e:
+            errors += len(batch)
+            logger.error("[%s] erreur reseau push batch : %s", source_nom, e)
+        time.sleep(0.25)
+
+    return {"pushed": pushed, "skipped": skipped, "errors": errors, "total": total}
+
+
+def _post_records_with_retry(records, max_retries=1):
+    attempt = 0
+    while True:
+        try:
+            resp = requests.post(
+                f"{API_BASE}/{ANNONCES_TABLE}",
+                headers=_headers(),
+                json={"records": records, "typecast": True},
+                timeout=HTTP_TIMEOUT,
+            )
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            time.sleep(1.0 * attempt)
+            continue
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            if attempt >= max_retries:
+                return resp
+            attempt += 1
+            time.sleep(2.0 * attempt)
+            continue
+        return resp
+
+
+def update_source_status(source_nom: str, status: str = "OK", error: Optional[str] = None) -> None:
+    try:
+        search = requests.get(
+            f"{API_BASE}/{SOURCES_TABLE}",
+            headers=_headers(),
+            params={
+                "filterByFormula": f'{{nom}}="{_escape_formula_value(source_nom)}"',
+                "fields[]": "nom",
+                "maxRecords": 1,
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        search.raise_for_status()
+        records = search.json().get("records", [])
+        if not records:
+            logger.warning("[airtable] update_source_status : source %r absente, skip", source_nom)
+            return
+        record_id = records[0]["id"]
+        fields = {
+            "dernier_scraping": datetime.now(timezone.utc).isoformat(),
+            "statut_dernier_run": status if not error else f"ERR: {str(error)[:100]}",
+        }
+        patch = requests.patch(
+            f"{API_BASE}/{SOURCES_TABLE}/{record_id}",
+            headers=_headers(),
+            json={"fields": fields, "typecast": True},
+            timeout=HTTP_TIMEOUT,
+        )
+        patch.raise_for_status()
+    except Exception as e:
+        logger.error("[airtable] update_source_status(%s) : %s", source_nom, e)
+
+
+def list_all_annonces(fields: Optional[list] = None, only_missing_categorie: bool = False) -> list:
+    all_records = []
+    offset = None
+    page = 0
+    while True:
+        page += 1
+        params = {"pageSize": 100}
+        if offset:
+            params["offset"] = offset
+        if fields:
+            params["fields[]"] = fields
+        if only_missing_categorie:
+            params["filterByFormula"] = "NOT({categorie})"
+        try:
+            resp = requests.get(
+                f"{API_BASE}/{ANNONCES_TABLE}",
+                headers=_headers(),
+                params=params,
+                timeout=HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            logger.error("[airtable] list_all_annonces page %d : %s", page, e)
+            break
+        data = resp.json()
+        all_records.extend(data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            break
+        time.sleep(0.25)
+    logger.info("[airtable] %d annonces totales chargees", len(all_records))
+    return all_records
+
+
+def update_annonce_fields(record_id: str, fields: dict) -> bool:
+    if "alerte_envoyee" in fields:
+        logger.warning("[airtable] tentative ecriture alerte_envoyee bloquee (gere par Make)")
+        fields = {k: v for k, v in fields.items() if k != "alerte_envoyee"}
+    if not fields:
+        return True
+    try:
+        resp = requests.patch(
+            f"{API_BASE}/{ANNONCES_TABLE}/{record_id}",
+            headers=_headers(),
+            json={"fields": fields, "typecast": True},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.error("[airtable] update_annonce_fields(%s) : %s", record_id, e)
+        return False
+
+
+def batch_update_annonces(updates: list) -> dict:
+    if not updates:
+        return {"updated": 0, "errors": 0, "total": 0}
+    cleaned = []
+    for u in updates:
+        f = u.get("fields", {})
+        if "alerte_envoyee" in f:
+            logger.warning("[airtable] batch_update : alerte_envoyee bloque pour %s", u.get("id"))
+            f = {k: v for k, v in f.items() if k != "alerte_envoyee"}
+        cleaned.append({"id": u["id"], "fields": f})
+    updated = 0
+    errors = 0
+    for i in range(0, len(cleaned), 10):
+        batch = cleaned[i:i + 10]
+        try:
+            resp = requests.patch(
+                f"{API_BASE}/{ANNONCES_TABLE}",
+                headers=_headers(),
+                json={"records": batch, "typecast": True},
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                updated += len(batch)
+            else:
+                errors += len(batch)
+                logger.error("[airtable] batch_update HTTP %d : %s", resp.status_code, resp.text[:200])
+        except requests.RequestException as e:
+            errors += len(batch)
+            logger.error("[airtable] batch_update erreur reseau : %s", e)
+        time.sleep(0.25)
+    return {"updated": updated, "errors": errors, "total": len(cleaned)}
+
+
+def _escape_formula_value(s: str) -> str:
+    return (s or "").replace('"', "'")
