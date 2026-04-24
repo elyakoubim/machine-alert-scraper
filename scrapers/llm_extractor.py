@@ -26,28 +26,37 @@ CATEGORIES = [
 ]
 
 
-SYSTEM_PROMPT = """Tu es un assistant de classification d'annonces d'encheres et de liquidations.
+SYSTEM_PROMPT = """Tu es un assistant de classification d'annonces d'enchères et de liquidations.
 
-Tu classes chaque annonce dans UNE SEULE des categories suivantes (liste fermee) :
+Tu classes chaque annonce dans UNE SEULE des catégories suivantes (liste fermée) :
 
-1. Immobilier : Batiments, entrepots, bureaux, terrains, hangars.
-2. Machines industrielles : Tours, fraiseuses, presses, lasers, compresseurs, chariots elevateurs.
-3. Materiel informatique : Serveurs, ordinateurs, ecrans, reseau, materiel IT.
+1. Immobilier : Bâtiments, entrepôts, bureaux, terrains, hangars.
+2. Machines industrielles : Tours, fraiseuses, presses, lasers, compresseurs, chariots élévateurs.
+3. Matériel informatique : Serveurs, ordinateurs, écrans, réseau, matériel IT.
 4. Mobilier : Mobilier de bureau, horeca, rayonnages, magasin, atelier.
-5. Stocks & liquidations : Palettes, surstocks, fins de serie, lots mixtes.
-6. Vehicules : Voitures, camions, utilitaires, engins de chantier, motos.
-7. Autre / non classe : Si rien ne correspond ou si le titre est trop vague.
+5. Stocks & liquidations : Palettes, surstocks, fins de série, lots mixtes.
+6. Véhicules : Voitures, camions, utilitaires, engins de chantier, motos.
+7. Autre / non classé : Si rien ne correspond ou si le titre est trop vague.
 
-Regles :
-- Chariot elevateur en usine -> Machines industrielles. Camion grue -> Vehicules.
-- Batiment industriel vide -> Immobilier.
+Règles :
+- Chariot élévateur en usine -> Machines industrielles. Camion grue -> Véhicules.
+- Bâtiment industriel vide -> Immobilier.
 - Lot mixte machines + stocks : selon dominante.
-- En cas de doute reel, reponds "Autre / non classe".
+- En cas de doute réel, réponds "Autre / non classé".
 
-Tu reponds UNIQUEMENT en JSON strict de cette forme :
+Tu réponds UNIQUEMENT en JSON strict de cette forme :
 {"categorie": "<une des 7 valeurs exactes avec accents>"}
 
-Pas de texte avant ni apres, pas de markdown."""
+Les 7 valeurs valides exactes (à recopier telles quelles avec accents) :
+- "Immobilier"
+- "Machines industrielles"
+- "Matériel informatique"
+- "Mobilier"
+- "Stocks & liquidations"
+- "Véhicules"
+- "Autre / non classé"
+
+Pas de texte avant ni après, pas de markdown."""
 
 
 class LLMExtractor:
@@ -110,6 +119,8 @@ class LLMExtractor:
             return "Autre / non classé"
 
         categorie = self._parse_json_categorie(raw_text)
+        # Normalisation : si Haiku renvoie sans accents, on remappe
+        categorie = self._normalize_accents(categorie)
         if categorie not in CATEGORIES:
             logger.warning(
                 "LLM a renvoye une categorie invalide : %r (brut : %r)",
@@ -118,6 +129,21 @@ class LLMExtractor:
             return "Autre / non classé"
 
         return categorie
+
+    @staticmethod
+    def _normalize_accents(categorie: str) -> str:
+        """
+        Mappe les versions sans accents vers les versions avec accents (Airtable).
+        Robustesse : meme si Haiku renvoie sans accents, on recupere la bonne valeur.
+        """
+        mapping = {
+            "Materiel informatique": "Matériel informatique",
+            "Vehicules": "Véhicules",
+            "Autre / non classe": "Autre / non classé",
+            "Vehicule": "Véhicules",
+            "Materiel": "Matériel informatique",
+        }
+        return mapping.get(categorie, categorie)
 
     @staticmethod
     def _build_user_message(
@@ -207,6 +233,7 @@ class LLMExtractor:
                 n = entry.get("n")
                 cat = entry.get("categorie")
                 if isinstance(n, int) and 1 <= n <= len(items):
+                    cat = LLMExtractor._normalize_accents(cat) if cat else cat
                     if cat in CATEGORIES:
                         results[n - 1] = cat
         except (json.JSONDecodeError, TypeError, AttributeError):
