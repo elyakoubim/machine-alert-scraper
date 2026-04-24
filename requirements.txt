@@ -1,5 +1,17 @@
+# HTTP clients
 requests==2.31.0
+httpx==0.27.2
+
+# HTML/XML parsing
 beautifulsoup4==4.12.3
 lxml==5.1.0
+
+# Browser automation (pour sites JS)
 playwright==1.42.0
+playwright-stealth==1.0.6
+
+# LLM extraction (Claude Haiku fallback)
+anthropic==0.39.0
+
+# Utilitaires
 python-dotenv==1.0.1
