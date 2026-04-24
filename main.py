@@ -1,133 +1,103 @@
 """
 Machine Alert — Orchestrateur principal
-Lance le scraping de toutes les sources actives et push vers Airtable
+========================================
 
-Usage:
-  python main.py                    # Scrape toutes les sources actives
-  python main.py --source Clicpublic  # Scrape une source spécifique
-  python main.py --dry-run          # Test sans écrire dans Airtable
-  python main.py --source Clicpublic --dry-run  # Test d'une source
+Lance le scraping de toutes les sources actives et push vers Airtable.
+
+Usage :
+    python main.py                          # scrape tous les scrapers actifs
+    python main.py --source auctelia        # scrape un seul scraper (par slug)
+    python main.py --dry-run                # test sans écrire dans Airtable
+    python main.py --source auctelia --dry-run
+    python main.py --list                   # liste les scrapers disponibles
+
+Découverte automatique :
+    Chaque fichier .py dans scrapers/sites/ est inspecté. Toute classe qui
+    hérite de BaseScraper et expose source_nom/source_pays/base_url est
+    automatiquement enregistrée et exécutable.
+
+    Il n'y a pas de config manuelle à maintenir — ajouter un nouveau
+    scraper = créer un nouveau fichier dans scrapers/sites/.
 """
 
+from __future__ import annotations
+
 import argparse
+import importlib
+import inspect
 import logging
+import pkgutil
 import sys
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional
 
-from config import SOURCES
-from scrapers.static import StaticScraper
-from scrapers.dynamic import DynamicScraper
+# Charge .env dès le début
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import airtable
+from scrapers.base import BaseScraper
+from scrapers.llm_extractor import LLMExtractor
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-      
-    ],
+    format="%(asctime)s [%(levelname)s] %(name)s : %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
 
-def get_scraper(config: dict):
-    scraper_type = config.get("type", "static")
-    if scraper_type == "dynamic":
-        return DynamicScraper(config)
-    else:
-        return StaticScraper(config)
+# =============================================================================
+# Découverte automatique des scrapers dans scrapers/sites/
+# =============================================================================
 
+def discover_scrapers() -> dict[str, type[BaseScraper]]:
+    """Parcourt scrapers/sites/ et renvoie un dict { source_nom: Classe }.
 
-def run_source(config: dict, dry_run: bool = False) -> dict:
-    nom = config["nom"]
-    start = time.time()
-    result = {"nom": nom, "annonces": 0, "pushed": 0, "errors": 0, "duration": 0}
+    N'instancie PAS les classes ici — on les instanciera plus tard avec
+    le fetcher et le LLMExtractor appropriés.
+    """
+    registry: dict[str, type[BaseScraper]] = {}
 
     try:
-        scraper = get_scraper(config)
-        annonces = scraper.scrape()
-        result["annonces"] = len(annonces)
+        import scrapers.sites as sites_pkg
+    except ImportError:
+        logger.warning("scrapers/sites/ package absent, aucun scraper chargé")
+        return registry
 
-        if dry_run:
-            logger.info(f"[{nom}] DRY RUN — {len(annonces)} annonces trouvées (non pushées)")
-            for a in annonces[:5]:
-                logger.info(f"  → {a.titre[:60]} | {a.url[:80]}")
-        else:
-            stats = airtable.push_annonces(annonces, nom)
-            airtable.update_source_status(nom, "OK")
-            result["pushed"] = stats["pushed"]
-            result["errors"] = stats["errors"]
-            logger.info(f"[{nom}] ✅ pushed={stats['pushed']} skipped={stats['skipped']} errors={stats['errors']}")
+    for module_info in pkgutil.iter_modules(sites_pkg.__path__):
+        module_name = f"scrapers.sites.{module_info.name}"
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.error("Impossible d'importer %s : %s", module_name, e)
+            continue
 
-    except Exception as e:
-        logger.error(f"[{nom}] ❌ Fatal error: {e}")
-        result["errors"] = 1
-        if not dry_run:
-            airtable.update_source_status(nom, "ERR", str(e))
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            # Doit hériter de BaseScraper, ne pas être BaseScraper lui-même,
+            # et avoir un source_nom configuré
+            if (
+                issubclass(obj, BaseScraper)
+                and obj is not BaseScraper
+                and getattr(obj, "source_nom", "")
+            ):
+                slug = obj.source_nom
+                if slug in registry:
+                    logger.warning(
+                        "Conflit : %s déjà enregistré, on garde le premier",
+                        slug,
+                    )
+                    continue
+                registry[slug] = obj
+                logger.debug("Scraper découvert : %s -> %s", slug, obj.__name__)
 
-    result["duration"] = round(time.time() - start, 1)
-    return result
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Machine Alert Scraper")
-    parser.add_argument("--source", help="Nom d'une source spécifique à scraper")
-    parser.add_argument("--dry-run", action="store_true", help="Ne pas écrire dans Airtable")
-    args = parser.parse_args()
-
-    # Créer dossier logs
-    import os
-    os.makedirs("logs", exist_ok=True)
-
-    # Sélectionner les sources
-    if args.source:
-        sources = [s for s in SOURCES if s["nom"].lower() == args.source.lower()]
-        if not sources:
-            logger.error(f"Source '{args.source}' non trouvée. Sources disponibles: {[s['nom'] for s in SOURCES]}")
-            sys.exit(1)
-    else:
-        sources = [s for s in SOURCES if s.get("actif", True)]
-
-    logger.info(f"{'='*60}")
-    logger.info(f"Machine Alert — Scraping de {len(sources)} sources")
-    logger.info(f"Mode: {'DRY RUN' if args.dry_run else 'PRODUCTION'}")
-    logger.info(f"{'='*60}")
-
-    results = []
-    total_start = time.time()
-
-    for i, source in enumerate(sources, 1):
-        logger.info(f"\n[{i}/{len(sources)}] {source['nom']} ({source['type'].upper()})")
-        result = run_source(source, dry_run=args.dry_run)
-        results.append(result)
-        # Pause entre sources pour ne pas surcharger
-        if i < len(sources):
-            time.sleep(2)
-
-    # ── Rapport final ─────────────────────────────────────────────────────────
-    total_duration = round(time.time() - total_start, 1)
-    total_pushed = sum(r["pushed"] for r in results)
-    total_annonces = sum(r["annonces"] for r in results)
-    total_errors = sum(r["errors"] for r in results)
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"RAPPORT FINAL — {total_duration}s")
-    logger.info(f"{'='*60}")
-    logger.info(f"Sources scrapées : {len(results)}")
-    logger.info(f"Annonces trouvées: {total_annonces}")
-    logger.info(f"Annonces pushées : {total_pushed}")
-    logger.info(f"Erreurs          : {total_errors}")
-    logger.info(f"{'='*60}")
-
-    # Détail par source
-    for r in results:
-        status = "✅" if r["errors"] == 0 else "❌"
-        logger.info(f"{status} {r['nom']:<30} {r['annonces']:>3} trouvées | {r['pushed']:>3} pushées | {r['duration']}s")
-
-    logger.info(f"{'='*60}\n")
+    return registry
 
 
-if __name__ == "__main__":
-    main()
+# =============================================================================
+# Résu
