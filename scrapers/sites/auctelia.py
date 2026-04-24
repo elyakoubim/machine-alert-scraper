@@ -1,269 +1,198 @@
 """
-Machine Alert — Scraper Auctelia (BE)
-======================================
+Scraper Auctelia (BE) - v2
+============================
 
-Site : https://www.auctelia.be
-Type : Maison de ventes aux enchères généraliste belge.
-Couverture : Faillites, liquidations, ventes volontaires (machines, mobilier,
-             véhicules, immobilier, stocks).
-Stratégie : HTML statique, parsable avec BeautifulSoup. Pas de JS requis.
+Strategie hybride :
+1. Liste les URLs depuis le sitemap upcoming-items-fr.xml (httpx, rapide)
+2. Filtre les URLs deja en Airtable (skip)
+3. Pour les nouvelles uniquement : Playwright pour avoir titre/image/prix/description
 
-POC : ce fichier sert à valider l'architecture du refactor v2 de bout en bout.
-      Une fois validé, on en fera des copies adaptées pour les 96 autres sites.
-
-Sélecteurs CSS :
-    À ajuster après inspection live (lance `--dry-run --max-annonces 5`
-    pour voir si on récupère bien des champs).
+Auctelia est un site Nuxt.js client-side : impossible de scraper en HTTP brut.
+Le sitemap est notre seul moyen de lister TOUTES les annonces.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import time
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
-from bs4 import BeautifulSoup
+import httpx
 
-from scrapers.base import BaseScraper
+from scrapers.base import BaseScraper, Annonce
+import airtable as airtable_client
 
 logger = logging.getLogger(__name__)
 
 
+SITEMAP_URL = "https://www.auctelia.com/sitemaps/upcoming-items-fr.xml"
+
+
 class AucteliaScraper(BaseScraper):
-    # === Configuration de classe (lue par BaseScraper et main.py) ===
-    source_nom = "auctelia"
+    source_nom = "Auctelia"
     source_pays = "BE"
-    base_url = "https://www.auctelia.be"
-    requires_javascript = False  # HTML statique
-    rate_limit_seconds = 2.0
-    default_category = "Autre / non classé"
+    base_url = "https://www.auctelia.com"
+    requires_javascript = True  # Sites pages de detail en client-side rendering
+    rate_limit_seconds = 1.5
+    default_category = "Autre / non classe"
 
-    # === Constantes propres au scraper ===
-    LISTING_PATH = "/fr/encheres"  # URL de la page catalogue principale
-    MAX_PAGES = 5  # Limite de pages catalogue à parcourir (sécurité)
-
-    # -------------------------------------------------------------------------
-    # 1) Liste des pages catalogue
-    # -------------------------------------------------------------------------
+    def __init__(self, fetcher=None, llm_extractor=None):
+        super().__init__(fetcher=fetcher, llm_extractor=llm_extractor)
+        self._existing_urls = None  # cache des URLs deja en Airtable
 
     def list_listing_urls(self) -> Iterator[str]:
-        """Génère les URLs des pages catalogue d'Auctelia.
-
-        Auctelia paginé classiquement avec ?page=N. On récupère les N premières
-        pour rester dans des temps raisonnables.
         """
-        for page in range(1, self.MAX_PAGES + 1):
-            if page == 1:
-                yield f"{self.base_url}{self.LISTING_PATH}"
-            else:
-                yield f"{self.base_url}{self.LISTING_PATH}?page={page}"
-
-    # -------------------------------------------------------------------------
-    # 2) Parse d'une page catalogue -> URLs d'annonces
-    # -------------------------------------------------------------------------
+        On ne fait pas de listing classique :
+        on retourne juste l'URL du sitemap pour declencher run().
+        """
+        yield SITEMAP_URL
 
     def parse_listing(self, html: str, listing_url: str) -> Iterator[str]:
-        """Extrait les URLs des annonces individuelles depuis une page catalogue."""
-        soup = BeautifulSoup(html, "lxml")
+        """
+        Parse le sitemap XML et yield les URLs d'annonces NON DEJA presentes en Airtable.
+        Le tri est fait par lastmod desc (les plus recentes en premier).
+        """
+        # Parse XML simple (sans BeautifulSoup pour ce cas, regex suffit pour sitemap)
+        url_pattern = re.compile(
+            r"<url>\s*<loc>([^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>",
+            re.MULTILINE
+        )
+        matches = url_pattern.findall(html)
+        logger.info("[%s] sitemap : %d URLs trouvees", self.source_nom, len(matches))
 
-        # Heuristique : les liens vers des annonces contiennent généralement
-        # "/lot/" ou "/vente/" dans leur URL chez Auctelia.
-        seen: set[str] = set()
-        for a in soup.select("a[href]"):
-            href = a.get("href", "")
-            url = self.normalize_url(href)
+        if not matches:
+            return
 
-            # Garder uniquement les liens internes vers des annonces
-            if not url.startswith(self.base_url):
-                continue
-            if not (
-                "/lot/" in url
-                or "/vente/" in url
-                or re.search(r"/v\d+/", url)
-            ):
-                continue
-            if not self.is_valid_annonce_url(url):
-                continue
-            if url in seen:
-                continue
+        # Charger les URLs existantes en Airtable (une seule fois)
+        if self._existing_urls is None:
+            try:
+                self._existing_urls = airtable_client.get_existing_urls(self.source_nom)
+                logger.info(
+                    "[%s] %d URLs deja en Airtable, on skip celles-la",
+                    self.source_nom, len(self._existing_urls),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Impossible de charger URLs existantes : %s. On scrape tout.",
+                    self.source_nom, e,
+                )
+                self._existing_urls = set()
 
-            seen.add(url)
+        # Filtrer + trier par lastmod desc (plus recentes en premier)
+        nouvelles = [
+            (url, lastmod) for url, lastmod in matches
+            if url not in self._existing_urls
+        ]
+        nouvelles.sort(key=lambda x: x[1], reverse=True)
+
+        logger.info(
+            "[%s] %d nouvelles annonces a scraper (sur %d total)",
+            self.source_nom, len(nouvelles), len(matches),
+        )
+
+        for url, lastmod in nouvelles:
+            # On stocke lastmod dans un dict global temporaire pour le passer a parse_detail
+            self._lastmods = getattr(self, "_lastmods", {})
+            self._lastmods[url] = lastmod
             yield url
 
-    # -------------------------------------------------------------------------
-    # 3) Parse d'une page détail -> dict de champs bruts
-    # -------------------------------------------------------------------------
+    def fetch(self, url: str) -> str:
+        """
+        Override fetch :
+        - Si c'est le sitemap : httpx (XML rapide)
+        - Sinon : Playwright (page de detail JS)
+        """
+        if url == SITEMAP_URL or url.endswith(".xml"):
+            self._respect_rate_limit()
+            try:
+                resp = httpx.get(url, timeout=15.0, follow_redirects=True)
+                resp.raise_for_status()
+                self._last_request_at = time.time()
+                return resp.text
+            except Exception as e:
+                logger.error("[%s] Erreur fetch sitemap : %s", self.source_nom, e)
+                raise
+        # Sinon : utilise le fetcher Playwright via BaseScraper
+        return super().fetch(url)
 
     def parse_detail(self, html: str, url: str) -> dict:
-        """Extrait les champs d'une page annonce détail."""
+        """
+        Parse une page de detail Auctelia.
+        Extrait : titre (h1), image (og:image), description, prix, date_fin.
+        """
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
 
-        titre = self._extract_titre(soup)
-        description = self._extract_description(soup)
-        prix = self._extract_prix(soup)
-        image_url = self._extract_image(soup)
-        categorie_native = self._extract_categorie(soup)
-        date_fin_brut = self._extract_date_fin(soup)
+        # Titre depuis h1
+        h1 = soup.find("h1")
+        titre = self.clean_text(h1.get_text() if h1 else "")
 
-        # ID natif Auctelia : on tente de l'extraire de l'URL
-        m = re.search(r"/(\d{4,})(?:[/_\-]|$)", url)
-        source_id = m.group(1) if m else ""
+        # Si pas de h1, fallback sur le slug de l'URL
+        if not titre:
+            slug_match = re.search(r"/materiel-occasion/([^/]+)/", url)
+            if slug_match:
+                titre = slug_match.group(1).replace("-", " ").capitalize()
+
+        # Image depuis og:image
+        og_image = soup.find("meta", property="og:image")
+        image_url = og_image.get("content", "") if og_image else ""
+
+        # Description : tout le texte sous "Informations complementaires" ou le texte principal
+        description = ""
+        info_section = soup.find(string=re.compile(r"Informations compl", re.IGNORECASE))
+        if info_section and info_section.parent:
+            # Prendre le parent et extraire son texte
+            section = info_section.find_parent()
+            if section:
+                description = self.clean_text(section.get_text())[:2000]
+
+        # Si pas de description riche, prendre le texte du body
+        if not description and soup.body:
+            description = self.clean_text(soup.body.get_text())[:1500]
+
+        # Prix : chercher le pattern "Enchere actuelle ... XX EUR"
+        prix = ""
+        body_text = soup.body.get_text() if soup.body else ""
+        prix_match = re.search(
+            r"(?:Enchere actuelle|Prix(?: de depart)?)[\s:]*(\d+(?:[\.,]\d+)?)\s*(?:EUR|EUR)",
+            body_text, re.IGNORECASE
+        )
+        if prix_match:
+            prix = prix_match.group(1).replace(",", ".") + " EUR"
+        else:
+            # Fallback : chercher juste un montant en EUR
+            prix_simple = re.search(r"(\d+(?:[\.,]\d{1,2})?)\s*(?:EUR|EUR)", body_text)
+            if prix_simple:
+                prix = prix_simple.group(1).replace(",", ".") + " EUR"
+
+        # Date fin : "Fin de vente : DD/MM/YYYY a HH:MM"
+        date_fin = None
+        date_match = re.search(
+            r"Fin de vente[\s:]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            body_text, re.IGNORECASE
+        )
+        if date_match:
+            date_fin = date_match.group(1)
+
+        # Lastmod du sitemap comme date_publication
+        date_pub = getattr(self, "_lastmods", {}).get(url)
 
         return {
             "titre": titre,
             "description": description,
-            "prix": prix,
             "image_url": image_url,
-            "type_vente": "enchere",  # Auctelia = maison d'enchères
-            "categorie_native": categorie_native,
-            "date_fin_brut": date_fin_brut,
-            "source_id": source_id,
+            "prix": prix,
+            "type_vente": "Enchere",
+            "date_fin_brut": date_fin,
+            "date_publication_brut": date_pub,
+            "categorie_native": "",  # Auctelia ne fournit pas de categorie native exploitable
         }
 
-    # -------------------------------------------------------------------------
-    # 4) Mapping de catégorie native -> taxonomie Faillink
-    # -------------------------------------------------------------------------
-
     def map_category(self, native_category: Optional[str]) -> str:
-        """Mappe la catégorie affichée par Auctelia vers les 7 catégories Faillink.
-
-        Si pas de match, retourne default_category et BaseScraper utilisera
-        le fallback LLM Haiku automatiquement.
         """
-        if not native_category:
-            return self.default_category
-
-        nat = native_category.lower().strip()
-
-        # Mots-clés -> catégorie Faillink
-        rules = [
-            (["immobilier", "bâtiment", "batiment", "terrain", "appartement"],
-             "Immobilier"),
-            (["machine", "industriel", "outil", "atelier", "production"],
-             "Machines industrielles"),
-            (["informatique", "ordinateur", "serveur", "it", "réseau", "reseau"],
-             "Matériel informatique"),
-            (["mobilier", "bureau", "horeca", "rayonnage"],
-             "Mobilier"),
-            (["stock", "liquidation", "palette", "lot"],
-             "Stocks & liquidations"),
-            (["véhicule", "vehicule", "voiture", "camion", "utilitaire", "moto"],
-             "Véhicules"),
-        ]
-
-        for keywords, faillink_cat in rules:
-            if any(kw in nat for kw in keywords):
-                return faillink_cat
-
+        Pas de mapping de categorie native pour Auctelia :
+        on laisse Claude Haiku decider via le LLM extractor du BaseScraper.
+        """
         return self.default_category
-
-    # -------------------------------------------------------------------------
-    # Helpers privés (extraction des champs depuis le HTML)
-    # -------------------------------------------------------------------------
-
-    def _extract_titre(self, soup: BeautifulSoup) -> str:
-        """Cherche le titre de l'annonce dans plusieurs sélecteurs candidats."""
-        # Tentatives par ordre de spécificité décroissante
-        selectors = [
-            "h1.lot-title",
-            "h1.product-title",
-            "h1[itemprop='name']",
-            "h1",
-            "title",
-        ]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el:
-                txt = self.clean_text(el.get_text())
-                if txt:
-                    return txt
-        return ""
-
-    def _extract_description(self, soup: BeautifulSoup) -> str:
-        """Description longue de l'annonce."""
-        selectors = [
-            "div.lot-description",
-            "div.product-description",
-            "div[itemprop='description']",
-            "section.description",
-            "meta[name='description']",
-        ]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if not el:
-                continue
-            if el.name == "meta":
-                content = el.get("content", "")
-                if content:
-                    return self.clean_text(content)
-            else:
-                txt = self.clean_text(el.get_text(separator=" "))
-                if txt:
-                    return txt
-        return ""
-
-    def _extract_prix(self, soup: BeautifulSoup) -> str:
-        """Prix actuel ou prix de départ."""
-        selectors = [
-            "span.current-bid",
-            "span.lot-price",
-            "[itemprop='price']",
-            "div.bid-amount",
-        ]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el:
-                txt = self.clean_text(el.get_text())
-                if txt:
-                    return txt
-        return ""
-
-    def _extract_image(self, soup: BeautifulSoup) -> str:
-        """URL de l'image principale."""
-        # Priorité à la balise og:image (souvent la plus fiable)
-        og = soup.select_one("meta[property='og:image']")
-        if og and og.get("content"):
-            return self.normalize_url(og["content"])
-
-        # Fallback : première grosse image dans la zone produit
-        for sel in ["img.lot-image", "img.product-image", "div.lot-gallery img"]:
-            img = soup.select_one(sel)
-            if img and img.get("src"):
-                return self.normalize_url(img["src"])
-
-        return ""
-
-    def _extract_categorie(self, soup: BeautifulSoup) -> str:
-        """Catégorie native (breadcrumb ou tag)."""
-        # Breadcrumb : on prend le dernier (le plus spécifique)
-        breadcrumb_items = soup.select("nav.breadcrumb a, ol.breadcrumb a")
-        if breadcrumb_items:
-            return self.clean_text(breadcrumb_items[-1].get_text())
-
-        # Tag/badge de catégorie
-        for sel in ["span.lot-category", "div.product-category", "a.category"]:
-            el = soup.select_one(sel)
-            if el:
-                return self.clean_text(el.get_text())
-
-        return ""
-
-    def _extract_date_fin(self, soup: BeautifulSoup) -> str:
-        """Date de fin d'enchère (sera parsée en ISO par BaseScraper)."""
-        selectors = [
-            "[itemprop='endDate']",
-            "time.lot-end-date",
-            "span.end-date",
-            "div.countdown",
-        ]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el:
-                # Préférer l'attribut datetime si présent
-                dt = el.get("datetime")
-                if dt:
-                    return dt
-                txt = self.clean_text(el.get_text())
-                if txt:
-                    return txt
-        return ""
