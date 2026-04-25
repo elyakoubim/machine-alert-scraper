@@ -22,38 +22,68 @@ CATEGORIES = [
     "Mobilier",
     "Stocks & liquidations",
     "Véhicules",
+    "Outillage & équipement chantier",
     "Autre / non classé",
 ]
 
 
 SYSTEM_PROMPT = """Tu es un assistant de classification d'annonces d'enchères et de liquidations.
 
-Tu classes chaque annonce dans UNE SEULE des catégories suivantes (liste fermée) :
+Tu classes chaque annonce dans UNE SEULE des 8 catégories suivantes (liste fermée) :
 
-1. Immobilier : Bâtiments, entrepôts, bureaux, terrains, hangars.
-2. Machines industrielles : Tours, fraiseuses, presses, lasers, compresseurs, chariots élévateurs.
-3. Matériel informatique : Serveurs, ordinateurs, écrans, réseau, matériel IT.
-4. Mobilier : Mobilier de bureau, horeca, rayonnages, magasin, atelier.
-5. Stocks & liquidations : Palettes, surstocks, fins de série, lots mixtes.
-6. Véhicules : Voitures, camions, utilitaires, engins de chantier, motos.
-7. Autre / non classé : Si rien ne correspond ou si le titre est trop vague.
+1. Immobilier : Bâtiments, entrepôts, bureaux, terrains, hangars, locaux commerciaux, maisons, appartements.
 
-Règles :
-- Chariot élévateur en usine -> Machines industrielles. Camion grue -> Véhicules.
-- Bâtiment industriel vide -> Immobilier.
-- Lot mixte machines + stocks : selon dominante.
-- En cas de doute réel, réponds "Autre / non classé".
+2. Machines industrielles : Machines FIXES et lourdes pour usine ou production professionnelle.
+   Exemples : tour CNC, fraiseuse, presse hydraulique, ligne de production, compresseur industriel,
+   centre d'usinage, machine d'emballage, banderoleuse, four industriel, chaudière industrielle.
+
+3. Matériel informatique : Serveurs, ordinateurs, écrans, équipement réseau, matériel IT professionnel.
+
+4. Mobilier : Mobilier de bureau, horeca, rayonnages, magasin, atelier, mobilier de stockage.
+
+5. Stocks & liquidations : Palettes, surstocks, fins de série, lots mixtes de marchandises,
+   lots de vêtements, lots d'articles divers à revendre.
+
+6. Véhicules : TOUT ce qui transporte ou permet de se déplacer.
+   Exemples : voitures, camions, utilitaires, motos, scooters, mobylettes,
+   VÉLOS (tous types : VTT, vélos pliants, vélos électriques, vélos de course),
+   BATEAUX (à moteur, voiliers, jet-skis, embarcations), kayaks,
+   engins de chantier mobiles (chariots élévateurs auto-tractés, mini-pelles, tracteurs),
+   remorques, caravanes, trottinettes électriques.
+
+7. Outillage & équipement chantier : Outillage électroportatif et manuel, équipement de chantier mobile.
+   Exemples : perceuses, visseuses, scies (circulaires, sauteuses), ponceuses, meuleuses,
+   échafaudages, étais, tréteaux, échelles, containers de chantier, bennes,
+   machines à bois pour artisans (toupies, raboteuses, scies à ruban),
+   bétonnières mobiles, brouettes pro, outillage main (clés, pinces, marteaux),
+   matériel de soudure portable.
+
+8. Autre / non classé : Si rien ne correspond ou si le titre est trop vague pour décider.
+   Exemples : feux tricolores, articles ferroviaires divers, équipements très spécialisés
+   sans catégorie claire.
+
+Règles importantes pour la distinction :
+- "Machines industrielles" = machine FIXE pour usine professionnelle (lourde, gros volume).
+- "Outillage & équipement chantier" = matériel MOBILE pour artisan/chantier (plus léger, transportable).
+- Chariot élévateur = "Véhicules" (engin auto-tracté).
+- Tour à bois pour menuisier = "Outillage & équipement chantier" (machine pour artisan).
+- Tour CNC industriel = "Machines industrielles" (machine de production).
+- Vélo, bateau, moto, scooter = TOUJOURS "Véhicules" (mobilité).
+- Bâtiment commercial = "Immobilier".
+- Serveur informatique = "Matériel informatique".
+- En cas de doute réel après avoir essayé toutes les catégories, réponds "Autre / non classé".
 
 Tu réponds UNIQUEMENT en JSON strict de cette forme :
-{"categorie": "<une des 7 valeurs exactes avec accents>"}
+{"categorie": "<une des 8 valeurs exactes avec accents>"}
 
-Les 7 valeurs valides exactes (à recopier telles quelles avec accents) :
+Les 8 valeurs valides exactes (à recopier telles quelles avec accents) :
 - "Immobilier"
 - "Machines industrielles"
 - "Matériel informatique"
 - "Mobilier"
 - "Stocks & liquidations"
 - "Véhicules"
+- "Outillage & équipement chantier"
 - "Autre / non classé"
 
 Pas de texte avant ni après, pas de markdown."""
@@ -142,6 +172,9 @@ class LLMExtractor:
             "Autre / non classe": "Autre / non classé",
             "Vehicule": "Véhicules",
             "Materiel": "Matériel informatique",
+            "Outillage & equipement chantier": "Outillage & équipement chantier",
+            "Outillage et equipement chantier": "Outillage & équipement chantier",
+            "Outillage & équipement de chantier": "Outillage & équipement chantier",
         }
         return mapping.get(categorie, categorie)
 
@@ -204,7 +237,7 @@ class LLMExtractor:
             numbered.append(entry)
 
         user_message = (
-            "Classe chacune des annonces suivantes dans une des 7 categories Faillink.\n\n"
+            "Classe chacune des annonces suivantes dans une des 8 categories Faillink.\n\n"
             + "\n".join(numbered)
             + "\n\nReponds UNIQUEMENT avec ce JSON (pas de texte autour) :\n"
             + '{"resultats": [{"n": 1, "categorie": "<valeur>"}, ...]}'
