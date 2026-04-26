@@ -5,11 +5,12 @@ Scraper Restlos (DE) - v2
 Strategie HTTP statique :
 1. Liste les URLs depuis la page /auktionen?astatus=current
 2. Filtre les URLs deja en Airtable (skip)
-3. Pour les nouvelles : fetch httpx + parse meta og: (HTML statique)
+3. Pour les nouvelles : fetch via Playwright + parse meta og:
 
-Restlos est un site Angular SSR (server-side rendered) :
-le HTML brut contient deja toutes les meta og: et la liste des lots.
-Pas besoin de Playwright !
+Restlos a un anti-bot strict (Cloudflare).
+ScraperAPI Free ne supporte pas ce domaine (host_not_allowed).
+On utilise donc Playwright (gratuit) qui simule un vrai navigateur
+et passe l'anti-bot.
 
 1 ligne Airtable = 1 vente entiere (auction)
    -> Voir ses lots individuels sur le site externe
@@ -45,23 +46,14 @@ class RestlosScraper(BaseScraper):
     source_nom = "Restlos"
     source_pays = "DE"
     base_url = BASE_URL
-    requires_javascript = False  # HTML statique, pas besoin de Playwright
+    requires_javascript = True  # Restlos a un anti-bot, Playwright passe ou
     rate_limit_seconds = 1.5
     default_category = "Autre / non classe"
 
     def __init__(self, fetcher=None, llm_extractor=None):
-        # Restlos a un anti-bot strict : on force ScraperApi
-        # render_js=False car HTML deja statique (Angular SSR)
-        if fetcher is None:
-            from scrapers.fetchers import ScraperApiFetcher
-            try:
-                fetcher = ScraperApiFetcher(render_js=False)
-            except RuntimeError:
-                logger.warning(
-                    "[%s] SCRAPERAPI_KEY absente, fallback sur HttpxFetcher "
-                    "(risque 403)",
-                    self.source_nom,
-                )
+        # Restlos a un anti-bot strict (Cloudflare).
+        # Playwright (gratuit) simule un vrai navigateur et passe l'anti-bot.
+        # ScraperAPI Free ne supporte pas ce domaine (host_not_allowed).
         super().__init__(fetcher=fetcher, llm_extractor=llm_extractor)
         self._existing_urls = None
 
