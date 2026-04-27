@@ -5,254 +5,165 @@ Machine Alert — Fetchers
 Trois fetchers interchangeables pour récupérer le HTML d'une URL :
 
     HttpxFetcher        -> requêtes HTTP simples (sites HTML statiques).
-                           Rapide, gratuit, 60% des sites passent avec ça.
-
     PlaywrightFetcher   -> navigateur headless (sites SPA / JS-rendered).
-                           Gratuit, ~30% des sites nécessitent ça.
-
-    ScraperApiFetcher   -> proxy anti-bot managé (Cloudflare, captcha).
-                           Payant au-delà de 5000 requêtes/mois.
-                           Fallback pour ~10% des sites coriaces.
+                           Utilise async_playwright dans un thread séparé
+                           pour éviter le conflit asyncio loop.
+    ScraperApiFetcher   -> proxy anti-bot managé.
 
 Tous exposent la même interface :
-    fetch(url: str) -> str    # renvoie le HTML brut
-
-Un scraper peut en instancier un et le passer au BaseScraper, ou laisser
-BaseScraper créer un HttpxFetcher ou PlaywrightFetcher par défaut selon
-son attribut `requires_javascript`.
+    fetch(url: str) -> str
 """
-
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from abc import ABC, abstractmethod
+import threading
+import time
 from typing import Optional
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Interface commune
-# =============================================================================
+# ============================================================
+# HttpxFetcher
+# ============================================================
 
-class BaseFetcher(ABC):
-    """Interface commune à tous les fetchers."""
+class HttpxFetcher:
+    """Fetcher HTTP simple via httpx (sync)."""
 
-    @abstractmethod
+    def __init__(self, timeout: int = 30):
+        self.timeout = timeout
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        }
+
     def fetch(self, url: str) -> str:
-        """Récupère le HTML d'une URL. Lève une exception si échec."""
-        ...
-
-    def close(self) -> None:
-        """Libère les ressources (navigateur, clients HTTP). Optionnel."""
-        pass
+        with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=self.headers) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            return r.text
 
 
-# =============================================================================
-# 1) HttpxFetcher — HTTP simple (défaut pour sites statiques)
-# =============================================================================
+# ============================================================
+# PlaywrightFetcher (FIXED : thread + async_playwright)
+# ============================================================
 
-class HttpxFetcher(BaseFetcher):
-    """Fetcher HTTP basé sur httpx.
-
-    Avantages : très rapide, zéro coût, pas de navigateur à lancer.
-    Limitations : ne rend pas le JavaScript, peut être bloqué par anti-bot.
+class PlaywrightFetcher:
+    """
+    Fetcher Playwright qui contourne le bug 'sync API in asyncio loop'.
+    
+    Solution : on lance async_playwright dans un thread séparé avec
+    sa propre event loop. Ça permet de garder l'API sync côté scraper.
     """
 
-    def __init__(
-        self,
-        user_agent: Optional[str] = None,
-        timeout: float = 30.0,
-    ):
-        import httpx
-        ua = user_agent or os.getenv(
-            "USER_AGENT",
-            "Mozilla/5.0 (compatible; FaillinkBot/1.0; "
-            "+https://faillink.be/bot)",
-        )
-        self._client = httpx.Client(
-            headers={"User-Agent": ua},
-            timeout=timeout,
-            follow_redirects=True,
+    def __init__(self, timeout: int = 30000, wait_until: str = "networkidle"):
+        self.timeout = timeout
+        self.wait_until = wait_until
+        self.user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
         )
 
     def fetch(self, url: str) -> str:
-        response = self._client.get(url)
-        response.raise_for_status()
-        return response.text
+        """
+        Fetch HTML via Playwright async, exécuté dans un thread séparé.
+        Ça évite le bug 'sync API inside asyncio loop' qui apparaît quand
+        le SDK Anthropic (ou autre) a déjà initialisé une event loop.
+        """
+        result_container = []
+        exception_container = []
 
-    def close(self) -> None:
-        self._client.close()
+        def run_in_thread():
+            try:
+                from playwright.async_api import async_playwright
 
+                async def _async_fetch():
+                    async with async_playwright() as p:
+                        browser = await p.chromium.launch(
+                            headless=True,
+                            args=[
+                                "--no-sandbox",
+                                "--disable-dev-shm-usage",
+                                "--disable-blink-features=AutomationControlled",
+                            ],
+                        )
+                        context = await browser.new_context(
+                            user_agent=self.user_agent,
+                            locale="fr-FR",
+                            viewport={"width": 1920, "height": 1080},
+                        )
+                        page = await context.new_page()
+                        try:
+                            await page.goto(url, timeout=self.timeout, wait_until=self.wait_until)
+                            html = await page.content()
+                            return html
+                        finally:
+                            await context.close()
+                            await browser.close()
 
-# =============================================================================
-# 2) PlaywrightFetcher — Navigateur headless (sites JS)
-# =============================================================================
-
-class PlaywrightFetcher(BaseFetcher):
-    """Fetcher navigateur basé sur Playwright + stealth.
-
-    Avantages : rend le JavaScript, passe sous les radars anti-bot simples.
-    Limitations : 5-10x plus lent que httpx, consomme de la RAM.
-
-    Le navigateur est créé de façon paresseuse (au premier fetch) pour
-    éviter un coût d'init si on ne l'utilise jamais.
-    """
-
-    def __init__(
-        self,
-        user_agent: Optional[str] = None,
-        timeout_ms: int = 30000,
-        use_stealth: bool = True,
-    ):
-        self._user_agent = user_agent or os.getenv(
-            "USER_AGENT",
-            "Mozilla/5.0 (compatible; FaillinkBot/1.0; "
-            "+https://faillink.be/bot)",
-        )
-        self._timeout_ms = timeout_ms
-        self._use_stealth = use_stealth
-        self._playwright = None
-        self._browser = None
-        self._context = None
-
-    def _ensure_browser(self) -> None:
-        """Lance Chromium au premier usage."""
-        if self._browser is not None:
-            return
-        from playwright.sync_api import sync_playwright
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        self._context = self._browser.new_context(
-            user_agent=self._user_agent,
-            viewport={"width": 1280, "height": 800},
-            locale="fr-BE",
-        )
-
-    def fetch(self, url: str) -> str:
-        self._ensure_browser()
-        page = self._context.new_page()
-        try:
-            if self._use_stealth:
+                # Nouvelle event loop dédiée au thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 try:
-                    from playwright_stealth import stealth_sync
-                    stealth_sync(page)
-                except ImportError:
-                    logger.debug(
-                        "playwright_stealth non installé, on continue sans"
-                    )
-                except Exception as e:
-                    logger.debug("stealth_sync a échoué (non bloquant) : %s", e)
+                    html = loop.run_until_complete(_async_fetch())
+                    result_container.append(html)
+                finally:
+                    loop.close()
 
-            page.goto(url, timeout=self._timeout_ms, wait_until="domcontentloaded")
-            # Petit délai pour laisser le JS hydrater le DOM
-            page.wait_for_timeout(1500)
-            html = page.content()
-            return html
-        finally:
-            page.close()
+            except Exception as e:
+                exception_container.append(e)
 
-    def close(self) -> None:
-        try:
-            if self._context is not None:
-                self._context.close()
-        except Exception:
-            pass
-        try:
-            if self._browser is not None:
-                self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright is not None:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self._context = None
-        self._browser = None
-        self._playwright = None
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+        t.join(timeout=120)  # max 2 min par fetch
+
+        if t.is_alive():
+            raise TimeoutError(f"Playwright fetch timeout after 120s : {url}")
+
+        if exception_container:
+            raise exception_container[0]
+
+        if not result_container:
+            raise RuntimeError(f"Playwright fetch a renvoyé aucun résultat : {url}")
+
+        return result_container[0]
 
 
-# =============================================================================
-# 3) ScraperApiFetcher — Fallback anti-bot managé
-# =============================================================================
+# ============================================================
+# ScraperApiFetcher
+# ============================================================
 
-class ScraperApiFetcher(BaseFetcher):
-    """Fetcher via ScraperAPI (https://www.scraperapi.com).
+class ScraperApiFetcher:
+    """Fetcher via ScraperAPI (proxy anti-bot)."""
 
-    À utiliser UNIQUEMENT quand HttpxFetcher et PlaywrightFetcher se font
-    bloquer (Cloudflare strict, captcha, ban d'IP). Coût : des crédits
-    sur ton compte ScraperAPI.
-
-    Plan Free : 5000 crédits/mois. Un site avec rendu JS coûte ~10 crédits
-    par page, un site simple 1 crédit. Donc ~500 pages JS/mois en gratuit.
-
-    Usage :
-        fetcher = ScraperApiFetcher(render_js=False)  # pour sites simples
-        fetcher = ScraperApiFetcher(render_js=True)   # pour sites JS+protégés
-    """
-
-    BASE_URL = "https://api.scraperapi.com"
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        render_js: bool = False,
-        country_code: Optional[str] = None,
-        timeout: float = 90.0,
-    ):
-        import httpx
-        self._api_key = api_key or os.getenv("SCRAPERAPI_KEY")
-        if not self._api_key:
-            raise RuntimeError(
-                "ScraperApiFetcher : SCRAPERAPI_KEY absent. "
-                "Définis la variable d'env ou passe api_key=... au constructeur."
-            )
-        self._render_js = render_js
-        self._country_code = country_code
-        self._client = httpx.Client(timeout=timeout, follow_redirects=True)
+    def __init__(self, api_key: Optional[str] = None, timeout: int = 60, render_js: bool = False):
+        self.api_key = api_key or os.getenv("SCRAPERAPI_KEY", "")
+        if not self.api_key:
+            raise ValueError("SCRAPERAPI_KEY manquante (env var ou param)")
+        self.timeout = timeout
+        self.render_js = render_js
+        self.base_url = "https://api.scraperapi.com/"
 
     def fetch(self, url: str) -> str:
         params = {
-            "api_key": self._api_key,
+            "api_key": self.api_key,
             "url": url,
         }
-        if self._render_js:
+        if self.render_js:
             params["render"] = "true"
-        if self._country_code:
-            params["country_code"] = self._country_code
 
-        response = self._client.get(self.BASE_URL, params=params)
-        # ScraperAPI renvoie 200 avec le HTML de la cible, ou 4xx/5xx si échec
-        response.raise_for_status()
-        return response.text
-
-    def close(self) -> None:
-        self._client.close()
-
-
-# =============================================================================
-# Helper de sélection automatique
-# =============================================================================
-
-def make_default_fetcher(requires_javascript: bool = False) -> BaseFetcher:
-    """Renvoie le fetcher approprié selon le besoin.
-
-    Par défaut :
-        - pas de JS -> HttpxFetcher (rapide)
-        - JS requis -> PlaywrightFetcher (gratuit, local)
-
-    Si tu veux forcer ScraperAPI sur un scraper spécifique, instancie-le
-    directement dans le __init__ du scraper :
-        super().__init__(fetcher=ScraperApiFetcher(render_js=True))
-    """
-    if requires_javascript:
-        return PlaywrightFetcher()
-    return HttpxFetcher()
+        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            r = client.get(self.base_url, params=params)
+            r.raise_for_status()
+            return r.text
