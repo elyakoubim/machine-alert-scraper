@@ -19,6 +19,20 @@ Strategie : HTTP statique + httpx (HTML classique ASP.NET, pas de JS).
    - meta description = description
 
 1 ligne Airtable = 1 lot individuel (kavel)
+
+CATEGORISATION :
+On retourne toujours "Autre / non classe" comme map_category().
+Le BaseScraper.normalize() detecte "Autre" et appelle automatiquement
+Claude Haiku 4.5 (LLMExtractor) pour categoriser proprement le lot
+dans une des 8 categories Faillink officielles :
+- Immobilier
+- Machines industrielles
+- Materiel informatique
+- Mobilier
+- Stocks & liquidations
+- Vehicules
+- Outillage & equipement chantier
+- Autre / non classe
 """
 
 from __future__ import annotations
@@ -71,52 +85,6 @@ MAX_PAGES_PER_VEILING = 50
 
 # Limite de sécurité : nb max de veilingen
 MAX_VEILINGEN = 30
-
-
-# Mapping des catégories Appelboom (mots-clés dans le titre/description)
-# vers les catégories standards du projet
-CATEGORY_KEYWORDS = {
-    "Vehicules": [
-        "voertuig", "auto", "wagen", "camion", "camionnette", "transit",
-        "ford", "volkswagen", "audi", "peugeot", "fiat", "dodge", "iveco",
-        "nissan", "jeep", "renault", "citroen", "leaf", "vrachtwagen",
-        "stationwagen", "vuilniswagen", "veegwagen", "polo", "caddy",
-    ],
-    "Outillage": [
-        "boormachine", "haakse slijper", "cirkelzaag", "decoupeerzaag",
-        "schroevendraaier", "boorhamer", "schaafmachine", "bandschuur",
-        "reciprozaag", "gereedschap", "makita", "dewalt", "bosch", "metabo",
-        "hilti", "festool", "multitool", "bovenfrees", "freesmachine",
-        "gereedschappen", "outillage",
-    ],
-    "Machines industrielles": [
-        "reachtruck", "heftruck", "machine", "houtbewerking", "frees",
-        "draaibank", "compressor", "generator", "stroomverdeel", "lasapparaat",
-        "industriel", "ingeneurs",
-    ],
-    "Energie": [
-        "zonnepaneel", "zonnepanelen", "batterij", "batterijen", "omvormer",
-        "solar", "panneau solaire", "panneaux solaires", "goodwe",
-    ],
-    "IT / Informatique": [
-        "laptop", "informatique", "ordinateur", "computer", "tft",
-        "scherm", "schermen", "e-reader", "audio apparatuur", "it materiaal",
-        "imprimante", "printer",
-    ],
-    "Mobilier": [
-        "kantoormeubilair", "showroomkeuken", "keuken", "mobilier",
-        "meubelen", "badkamermeubel", "bureau", "magazijnrek", "rekken",
-        "kantoor",
-    ],
-    "Materiaux construction": [
-        "container", "containers", "bureelcontainer", "materiaalcontainer",
-        "ladders", "ladder", "elektrakabel", "kabels", "aannemersmateriaal",
-    ],
-    "Stock / Marchandises": [
-        "wijnhandel", "inboedel", "stock", "marchandise", "showroom",
-        "verlichting",
-    ],
-}
 
 
 class AppelboomScraper(BaseScraper):
@@ -219,7 +187,12 @@ class AppelboomScraper(BaseScraper):
                 yield full_url
 
     def parse_detail(self, html: str, url: str) -> dict:
-        """Parse une page kavel et retourne un dict avec les champs raw."""
+        """Parse une page kavel et retourne un dict avec les champs raw.
+
+        Note: on ne categorise PAS ici. On laisse Claude Haiku 4.5
+        (via BaseScraper.normalize) faire le travail apres avoir vu
+        le titre + description complets.
+        """
         soup = BeautifulSoup(html, "html.parser")
 
         # Titre : h1 prioritaire
@@ -272,9 +245,11 @@ class AppelboomScraper(BaseScraper):
         if id_match:
             source_id = id_match.group(1)
 
-        # Categorie native : on n'a pas de breadcrumb categorie sur Appelboom,
-        # on laisse vide et on utilise map_category() basee sur le titre
-        categorie_native = titre
+        # categorie_native : on n'a PAS de categorie native sur Appelboom.
+        # On laisse vide -> map_category() retournera "Autre / non classe"
+        # -> BaseScraper.normalize() declenchera Claude Haiku automatiquement
+        # avec le titre + description complets pour categoriser correctement.
+        categorie_native = None
 
         return {
             "titre": titre,
@@ -287,20 +262,16 @@ class AppelboomScraper(BaseScraper):
         }
 
     def map_category(self, native_category: Optional[str]) -> str:
-        """Mappe le titre/description vers une categorie standard.
+        """Pas de mapping local : on retourne toujours 'Autre / non classe'.
 
-        Appelboom n'a pas de categorie native exposee dans le HTML, donc
-        on utilise des mots-cles dans le titre.
+        Le BaseScraper.normalize() detectera 'Autre' et appellera
+        automatiquement Claude Haiku 4.5 (LLMExtractor) pour categoriser
+        proprement le lot dans une des 8 categories Faillink officielles.
+
+        C'est plus precis qu'un dictionnaire de mots-cles statique car
+        Haiku comprend le contexte (ex: "Showroomkeuken" -> Mobilier
+        et pas Materiaux construction).
         """
-        if not native_category:
-            return self.default_category
-
-        text = native_category.lower()
-        for category, keywords in CATEGORY_KEYWORDS.items():
-            for kw in keywords:
-                if kw.lower() in text:
-                    return category
-
         return self.default_category
 
     @staticmethod
