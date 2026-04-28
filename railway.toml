@@ -5,9 +5,9 @@ builder = "nixpacks"
 buildCommand = "pip install -r requirements.txt && playwright install chromium"
 
 [deploy]
-startCommand = "python scripts/backfill_categories.py --dry-run --limit 5"
-healthcheckPath = "/"
-restartPolicyType = "on_failure"
+  startCommand = "python main.py"
+  healthcheckPath = "/"
+  restartPolicyType = "on_failure"
 
 [[services]]
-name = "machine-alert-scraper"
+  name = "machine-alert-scraper"
