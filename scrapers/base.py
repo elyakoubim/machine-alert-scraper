@@ -1,9 +1,17 @@
 """
-Machine Alert - BaseScraper (v2)
+Machine Alert - BaseScraper (v2.1 - patch cohérence catégories)
 
 Classe abstraite que tous les scrapers de site doivent etendre.
-"""
 
+CHANGEMENTS PAR RAPPORT À LA VERSION PRÉCÉDENTE :
+- CATEGORIES_FAILLINK : 8 valeurs canoniques AVEC accents (au lieu de 7 sans accents)
+  - Ajout de "Outillage & équipement chantier"
+  - Ajout des accents : Matériel informatique, Véhicules, Autre / non classé
+- default_category : "Autre / non classé" (avec accent é)
+- Annonce.to_airtable() : VALIDE et NORMALISE la catégorie avant l'envoi
+  → si la valeur n'est pas dans CATEGORIES_FAILLINK, fallback automatique
+  → empêche typecast=true de créer des doublons silencieusement
+"""
 from __future__ import annotations
 
 import hashlib
@@ -17,16 +25,63 @@ from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-
+# 8 catégories canoniques Faillink — AVEC accents
+# C'est la liste de référence absolue : aucune autre valeur ne doit
+# arriver dans Airtable.categorie. Si Haiku ou un parseur natif renvoie
+# une valeur hors de cette liste, on bascule automatiquement sur
+# default_category dans Annonce.to_airtable().
 CATEGORIES_FAILLINK = frozenset([
     "Immobilier",
     "Machines industrielles",
-    "Materiel informatique",
+    "Matériel informatique",
     "Mobilier",
     "Stocks & liquidations",
-    "Vehicules",
-    "Autre / non classe",
+    "Véhicules",
+    "Outillage & équipement chantier",
+    "Autre / non classé",
 ])
+
+DEFAULT_CATEGORY = "Autre / non classé"
+
+# Mapping de tolérance pour les anciennes valeurs sans accents.
+# Le code historique générait ces variantes ; ce mapping permet de les
+# convertir vers la valeur canonique sans casser les annonces existantes
+# pendant la phase de transition.
+_CATEGORY_LEGACY_MAP = {
+    "Materiel informatique": "Matériel informatique",
+    "Vehicules": "Véhicules",
+    "Outillage & equipement chantier": "Outillage & équipement chantier",
+    "Autre / non classe": "Autre / non classé",
+}
+
+
+def normalize_categorie(value: Optional[str]) -> str:
+    """
+    Normalise une valeur de catégorie pour qu'elle corresponde EXACTEMENT
+    à l'une des 8 valeurs canoniques de CATEGORIES_FAILLINK.
+
+    Règles, dans l'ordre :
+    1. Si vide / None → DEFAULT_CATEGORY
+    2. Si déjà dans CATEGORIES_FAILLINK → renvoyée telle quelle
+    3. Si dans le mapping legacy (sans accents) → version avec accents
+    4. Sinon → DEFAULT_CATEGORY (avec un warning dans les logs)
+    """
+    if not value:
+        return DEFAULT_CATEGORY
+    value = value.strip()
+    if value in CATEGORIES_FAILLINK:
+        return value
+    if value in _CATEGORY_LEGACY_MAP:
+        canonical = _CATEGORY_LEGACY_MAP[value]
+        logger.info(
+            "[base] catégorie legacy '%s' normalisée en '%s'", value, canonical
+        )
+        return canonical
+    logger.warning(
+        "[base] catégorie inconnue '%s' → fallback sur '%s'",
+        value, DEFAULT_CATEGORY,
+    )
+    return DEFAULT_CATEGORY
 
 
 @dataclass
@@ -39,7 +94,7 @@ class Annonce:
     prix: str = ""
     image_url: str = ""
     type_vente: str = ""
-    categorie: str = "Autre / non classe"
+    categorie: str = DEFAULT_CATEGORY
     indexed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -52,6 +107,10 @@ class Annonce:
         return hashlib.sha256(self.url.encode("utf-8")).hexdigest()[:16]
 
     def to_airtable(self) -> dict:
+        # Normalisation systématique de la catégorie au moment de l'envoi.
+        # Garantit qu'aucune valeur hors-liste ne peut atteindre Airtable,
+        # même si typecast=true est activé côté airtable.py.
+        categorie_clean = normalize_categorie(self.categorie)
         return {
             "url": self.url,
             "titre": self.titre[:255],
@@ -61,7 +120,7 @@ class Annonce:
             "prix": self.prix,
             "type_vente": self.type_vente,
             "image_url": self.image_url,
-            "categorie": self.categorie,
+            "categorie": categorie_clean,
             "indexed_at": self.indexed_at,
             "date_publication": self.date_publication,
             "date_fin": self.date_fin,
@@ -74,8 +133,8 @@ class Annonce:
             raise ValueError(f"titre trop court : {self.titre!r}")
         if not re.fullmatch(r"[A-Z]{2}", self.pays):
             raise ValueError(f"pays invalide : {self.pays!r}")
-        # Note: on accepte aussi les categories avec accents pour souplesse
-        # car certains scrapers peuvent les renvoyer accentuees
+        # Note: la catégorie n'est PAS validée ici car normalize_categorie()
+        # dans to_airtable() s'occupe du fallback.
 
 
 class BaseScraper(ABC):
@@ -84,7 +143,7 @@ class BaseScraper(ABC):
     base_url: str = ""
     requires_javascript: bool = False
     rate_limit_seconds: float = 2.0
-    default_category: str = "Autre / non classe"
+    default_category: str = DEFAULT_CATEGORY
 
     def __init__(self, fetcher=None, llm_extractor=None):
         if not self.source_nom or not self.source_pays or not self.base_url:
@@ -97,20 +156,16 @@ class BaseScraper(ABC):
         self._last_request_at = 0.0
 
     @abstractmethod
-    def list_listing_urls(self) -> Iterator[str]:
-        ...
+    def list_listing_urls(self) -> Iterator[str]: ...
 
     @abstractmethod
-    def parse_listing(self, html: str, listing_url: str) -> Iterator[str]:
-        ...
+    def parse_listing(self, html: str, listing_url: str) -> Iterator[str]: ...
 
     @abstractmethod
-    def parse_detail(self, html: str, url: str) -> dict:
-        ...
+    def parse_detail(self, html: str, url: str) -> dict: ...
 
     @abstractmethod
-    def map_category(self, native_category: Optional[str]) -> str:
-        ...
+    def map_category(self, native_category: Optional[str]) -> str: ...
 
     def fetch(self, url: str) -> str:
         self._respect_rate_limit()
@@ -145,13 +200,17 @@ class BaseScraper(ABC):
                 )
                 categorie = self.default_category
 
+        # Sécurité finale : on normalise dès la sortie de map_category/LLM.
+        # Garantit qu'on ne propage jamais une catégorie hors-liste,
+        # même si une sous-classe oublie de respecter la convention.
+        categorie = normalize_categorie(categorie)
+
         date_pub = _iso_or_none(
             raw.get("date_publication_brut") or raw.get("date_publication")
         )
         date_fin = _iso_or_none(
             raw.get("date_fin_brut") or raw.get("date_fin")
         )
-
         source_id = raw.get("source_id") or _source_id_from_url(url)
 
         annonce = Annonce(
@@ -182,7 +241,6 @@ class BaseScraper(ABC):
                     self.source_nom, listing_url, e,
                 )
                 continue
-
             for detail_url in self.parse_listing(html_listing, listing_url):
                 if detail_url in seen_urls:
                     continue
