@@ -6,25 +6,6 @@ Reçoit le webhook Tally du formulaire 5BEkrv et :
   2. Cherche 5 annonces dans Airtable Annonces matchant catégories + pays du lead
   3. Envoie un email teasé via Brevo (template simple HTML)
   4. Crée le lead dans Airtable Leads_Essai
-
-Déploiement Railway :
-  - Le service Railway existant `machine-alert-scraper` héberge déjà le cron.
-  - Pour le webhook on ajoute un service "web" avec ce serveur FastAPI.
-  - Procfile.web : `web: uvicorn webhook_server:app --host 0.0.0.0 --port $PORT`
-
-Variables d'environnement requises :
-  - AIRTABLE_TOKEN (déjà présent)
-  - AIRTABLE_BASE_ID (déjà présent, default appQrNOm3Q7D9uEed)
-  - AIRTABLE_ANNONCES_TABLE (déjà présent, default tbljV9HICBsPyqjQk)
-  - AIRTABLE_LEADS_ESSAI_TABLE (NOUVEAU, default tbl5LfC0pUmt4rUJl)
-  - BREVO_API_KEY (NOUVEAU, format xkeysib-...)
-  - BREVO_SENDER_EMAIL (NOUVEAU, ex: noreply@faillink.be)
-  - BREVO_SENDER_NAME (NOUVEAU, ex: "Faillink")
-
-Test local :
-  pip install fastapi uvicorn requests python-dotenv
-  uvicorn webhook_server:app --reload
-  → POST http://localhost:8000/webhook/tally avec le payload Tally
 """
 from __future__ import annotations
 
@@ -59,7 +40,7 @@ AIRTABLE_ANNONCES_TABLE = os.getenv("AIRTABLE_ANNONCES_TABLE", "tbljV9HICBsPyqjQ
 AIRTABLE_LEADS_ESSAI_TABLE = os.getenv("AIRTABLE_LEADS_ESSAI_TABLE", "tbl5LfC0pUmt4rUJl")
 
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
-BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "noreply@faillink.be")
+BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "contact@faillink.be")
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Faillink")
 
 AIRTABLE_API = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
@@ -119,6 +100,13 @@ def resolve_single_choice(fields: list, key: str) -> str:
     """Pour MULTIPLE_CHOICE (1 seul choix) — renvoie le label unique."""
     labels = resolve_multi_select(fields, key)
     return labels[0] if labels else ""
+
+
+def format_value(val) -> str:
+    """Convertit une valeur Airtable (string ou array) en string lisible."""
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val) if val else "—"
+    return str(val) if val else "—"
 
 
 def detect_email_type(email: str) -> str:
@@ -208,10 +196,7 @@ def send_email_essai_simple(
     categories: list,
     pays: list,
 ) -> bool:
-    """
-    Envoie un email teasé simple via Brevo (HTML brut, pas de template).
-    Version MVP — on créera un beau template Brevo plus tard.
-    """
+    """Envoie un email teasé simple via Brevo (HTML brut, pas de template)."""
     if not BREVO_API_KEY:
         logger.warning("[send_email] BREVO_API_KEY absent — email NON envoyé (skip)")
         return False
@@ -219,9 +204,9 @@ def send_email_essai_simple(
     annonces_html = ""
     for i, rec in enumerate(annonces, 1):
         f = rec.get("fields", {})
-        cat = f.get("categorie", "—")
-        py = f.get("pays", "—")
-        type_v = f.get("type_vente") or "Vente off-market"
+        cat = format_value(f.get("categorie"))
+        py = format_value(f.get("pays"))
+        type_v = format_value(f.get("type_vente")) if f.get("type_vente") else "Vente off-market"
         annonces_html += f"""
         <div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">
           <div style="font-size: 14px; color: #666;">Annonce {i} sur {len(annonces)}</div>
@@ -336,10 +321,7 @@ def health():
 
 @app.post("/webhook/tally")
 async def tally_webhook(request: Request):
-    """
-    Endpoint principal — reçoit le webhook Tally.
-    URL à configurer dans Tally : https://<ton-app>.up.railway.app/webhook/tally
-    """
+    """Endpoint principal — reçoit le webhook Tally."""
     try:
         body = await request.json()
     except Exception as e:
