@@ -5,9 +5,8 @@ builder = "nixpacks"
 buildCommand = "pip install -r requirements.txt && playwright install chromium"
 
 [deploy]
-  startCommand = "python main.py"
-  healthcheckPath = "/"
-  restartPolicyType = "on_failure"
+   healthcheckPath = "/"
+   restartPolicyType = "on_failure"
 
 [[services]]
-  name = "machine-alert-scraper"
+   name = "machine-alert-scraper"
