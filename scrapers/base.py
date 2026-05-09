@@ -101,6 +101,10 @@ class Annonce:
     date_publication: Optional[str] = None
     date_fin: Optional[str] = None
     source_id: str = ""
+    marque: Optional[str] = None
+    modele: Optional[str] = None
+    annee_fabrication: Optional[int] = None
+    etat: str = "inconnu"
 
     @property
     def id_unique(self) -> str:
@@ -111,7 +115,7 @@ class Annonce:
         # Garantit qu'aucune valeur hors-liste ne peut atteindre Airtable,
         # même si typecast=true est activé côté airtable.py.
         categorie_clean = normalize_categorie(self.categorie)
-        return {
+        payload = {
             "url": self.url,
             "titre": self.titre[:255],
             "source": self.source_nom,
@@ -124,7 +128,16 @@ class Annonce:
             "indexed_at": self.indexed_at,
             "date_publication": self.date_publication,
             "date_fin": self.date_fin,
+            "etat": self.etat,
         }
+        # Champs optionnels : si None, on omet la cle (Airtable laisse vide).
+        if self.marque is not None:
+            payload["marque"] = self.marque
+        if self.modele is not None:
+            payload["modele"] = self.modele
+        if self.annee_fabrication is not None:
+            payload["annee_fabrication"] = self.annee_fabrication
+        return payload
 
     def validate(self) -> None:
         if not self.url or not self.url.startswith("http"):
@@ -184,21 +197,62 @@ class BaseScraper(ABC):
         description = (raw.get("description") or "").strip()
         prix = (raw.get("prix") or raw.get("prix_brut") or "").strip()
         image_url = (raw.get("image_url") or "").strip()
-        type_vente = (raw.get("type_vente") or "").strip()
+        type_vente_raw = (raw.get("type_vente") or "").strip()
+        marque_raw = _coerce_str_field(raw.get("marque"))
+        modele_raw = _coerce_str_field(raw.get("modele"))
+        annee_raw = _coerce_year_field(raw.get("annee_fabrication"))
+        etat_v = raw.get("etat")
+        etat_raw = etat_v.strip().lower() if isinstance(etat_v, str) else ""
 
+        # 1) Categorie : map natif d'abord (rapide, pas de LLM)
         categorie = self.map_category(raw.get("categorie_native"))
-        if categorie == self.default_category and self._llm is not None:
+
+        # 2) Decide si extract() est necessaire. Skip si categorie deja resolue
+        # ET les 5 champs LLM-completables sont deja remplis cote scraper.
+        needs_llm_categorie = (categorie == self.default_category)
+        needs_llm_other = not (
+            type_vente_raw
+            and marque_raw is not None
+            and modele_raw is not None
+            and annee_raw is not None
+            and etat_raw
+        )
+
+        extracted = None
+        if (needs_llm_categorie or needs_llm_other) and self._llm is not None:
             try:
-                categorie = self._llm.categorize(
+                extracted = self._llm.extract(
                     titre=titre,
                     description=description,
+                    categorie_native=raw.get("categorie_native") or "",
                 )
             except Exception as e:
                 logger.warning(
-                    "[%s] LLM categorize a echoue pour %s : %s",
+                    "[%s] LLM extract a echoue pour %s : %s",
                     self.source_nom, url, e,
                 )
-                categorie = self.default_category
+                extracted = None
+
+        # 3) Fusion : raw gagne quand il est rempli, extracted comble les vides.
+        # Categorie : on ne touche que si map_category a renvoye le default.
+        if categorie == self.default_category and extracted is not None:
+            categorie = extracted["categorie"]
+
+        type_vente = type_vente_raw or (
+            extracted["type_vente"] if extracted else ""
+        )
+        marque = marque_raw if marque_raw is not None else (
+            extracted["marque"] if extracted else None
+        )
+        modele = modele_raw if modele_raw is not None else (
+            extracted["modele"] if extracted else None
+        )
+        annee_fabrication = annee_raw if annee_raw is not None else (
+            extracted["annee_fabrication"] if extracted else None
+        )
+        etat = etat_raw or (
+            extracted["etat"] if extracted else "inconnu"
+        )
 
         # Sécurité finale : on normalise dès la sortie de map_category/LLM.
         # Garantit qu'on ne propage jamais une catégorie hors-liste,
@@ -226,8 +280,19 @@ class BaseScraper(ABC):
             date_publication=date_pub,
             date_fin=date_fin,
             source_id=source_id,
+            marque=marque,
+            modele=modele,
+            annee_fabrication=annee_fabrication,
+            etat=etat,
         )
         annonce.validate()
+        logger.debug(
+            "[DEBUG normalize] titre=%r | desc=%r | cat=%s type_vente=%s marque=%s modele=%s annee=%s etat=%s",
+            titre[:80],
+            (description or "")[:120],
+            annonce.categorie, annonce.type_vente, annonce.marque, annonce.modele,
+            annonce.annee_fabrication, annonce.etat,
+        )
         return annonce
 
     def run(self) -> Iterator[Annonce]:
@@ -315,3 +380,26 @@ def _source_id_from_url(url: str) -> str:
     if m:
         return m.group(1)
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _coerce_str_field(v) -> Optional[str]:
+    """Normalise un champ string optionnel d'un raw dict : None si vide / sentinelle."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if len(s) < 2:
+        return None
+    if s.lower() in {"null", "none", "n/a", "na", "-", "?", "inconnu", "unknown"}:
+        return None
+    return s
+
+
+def _coerce_year_field(v) -> Optional[int]:
+    """Coerce vers int dans [1950, 2026], sinon None."""
+    if v is None:
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if 1950 <= n <= 2026 else None

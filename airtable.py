@@ -3,7 +3,8 @@ Machine Alert — Client Airtable (v2)
 ======================================
 
 Interface avec la base Airtable "Machine Alert MVP" :
-    - Table Annonces  : push des annonces scrapées (13 colonnes)
+    - Table Annonces  : push des annonces scrapées (17 colonnes — dont marque,
+                        modele, annee_fabrication, etat extraits par LLMExtractor)
     - Table Sources   : mise à jour du statut des runs
 
 IMPORTANT — SÉCURITÉ :
