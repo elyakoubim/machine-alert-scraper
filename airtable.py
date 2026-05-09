@@ -41,6 +41,10 @@ PROFILS_TABLE = os.getenv("AIRTABLE_PROFILS_TABLE", "tblXhuS0M1TtRuSel")
 API_BASE = f"https://api.airtable.com/v0/{BASE_ID}"
 HTTP_TIMEOUT = 20.0
 
+# Garde-fou anti boucle infinie pour list_all_annonces (200 pages * 100 = 20k records,
+# headroom confortable sur la base actuelle ~16k).
+MAX_PAGES = 200
+
 
 def _headers() -> dict:
     token = os.getenv("AIRTABLE_TOKEN") or AIRTABLE_TOKEN
@@ -160,6 +164,40 @@ def _post_records_with_retry(records, max_retries=1):
         return resp
 
 
+def _get_records_page_with_retry(params: dict, max_retries: int = 2) -> dict:
+    """GET une page de records depuis ANNONCES_TABLE avec retry sur erreurs transitoires.
+
+    Retry sur : Timeout, ConnectionError, HTTP 429, HTTP 5xx.
+    Backoff : 1s avant retry 1, 3s avant retry 2 (3 tentatives au total).
+    Apres retries epuises : RAISE (ne retourne PAS partial silencieusement).
+    Sur 4xx autres que 429 : RAISE immediatement (pas de retry).
+    """
+    backoffs = [1.0, 3.0]
+    attempt = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"{API_BASE}/{ANNONCES_TABLE}",
+                headers=_headers(),
+                params=params,
+                timeout=HTTP_TIMEOUT,
+            )
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt >= max_retries:
+                raise
+            time.sleep(backoffs[attempt])
+            attempt += 1
+            continue
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            if attempt >= max_retries:
+                resp.raise_for_status()  # raise HTTPError
+            time.sleep(backoffs[attempt])
+            attempt += 1
+            continue
+        resp.raise_for_status()  # raise pour 4xx autres que 429
+        return resp.json()
+
+
 def update_source_status(source_nom: str, status: str = "OK", error: Optional[str] = None) -> None:
     try:
         search = requests.get(
@@ -193,12 +231,21 @@ def update_source_status(source_nom: str, status: str = "OK", error: Optional[st
         logger.error("[airtable] update_source_status(%s) : %s", source_nom, e)
 
 
-def list_all_annonces(fields: Optional[list] = None, only_missing_categorie: bool = False) -> list:
+def list_all_annonces(
+    fields: Optional[list] = None,
+    only_missing_categorie: bool = False,
+    filter_formula: Optional[str] = None,
+) -> list:
     all_records = []
     offset = None
     page = 0
     while True:
         page += 1
+        if page > MAX_PAGES:
+            raise RuntimeError(
+                f"list_all_annonces : MAX_PAGES={MAX_PAGES} depasse "
+                f"({len(all_records)} records charges, anomalie ?)"
+            )
         params = {"pageSize": 100}
         if offset:
             params["offset"] = offset
@@ -206,18 +253,11 @@ def list_all_annonces(fields: Optional[list] = None, only_missing_categorie: boo
             params["fields[]"] = fields
         if only_missing_categorie:
             params["filterByFormula"] = "NOT({categorie})"
-        try:
-            resp = requests.get(
-                f"{API_BASE}/{ANNONCES_TABLE}",
-                headers=_headers(),
-                params=params,
-                timeout=HTTP_TIMEOUT,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.error("[airtable] list_all_annonces page %d : %s", page, e)
-            break
-        data = resp.json()
+        elif filter_formula:
+            params["filterByFormula"] = filter_formula
+        # _get_records_page_with_retry raise sur erreurs persistantes
+        # (au lieu du break silencieux precedent qui retournait partial).
+        data = _get_records_page_with_retry(params)
         all_records.extend(data.get("records", []))
         offset = data.get("offset")
         if not offset:

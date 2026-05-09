@@ -14,6 +14,7 @@ playwright-stealth==1.0.6
 anthropic==0.39.0
 
 # Utilitaires
+python-dateutil>=2.8.0
 python-dotenv==1.0.1
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
