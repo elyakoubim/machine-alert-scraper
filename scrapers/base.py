@@ -207,19 +207,17 @@ class BaseScraper(ABC):
         # 1) Categorie : map natif d'abord (rapide, pas de LLM)
         categorie = self.map_category(raw.get("categorie_native"))
 
-        # 2) Decide si extract() est necessaire. Skip si categorie deja resolue
-        # ET les 5 champs LLM-completables sont deja remplis cote scraper.
-        needs_llm_categorie = (categorie == self.default_category)
-        needs_llm_other = not (
-            type_vente_raw
-            and marque_raw is not None
-            and modele_raw is not None
-            and annee_raw is not None
-            and etat_raw
-        )
-
+        # 2) Appel LLM systematique des que self._llm est dispo.
+        # L'ancienne optimisation "skip si categorie OK et 5 champs remplis"
+        # etait fragile (besoin que TOUS les 5 champs soient remplis cote
+        # scraper, ce qu'aucun scraper actuel ne fait) et n'economisait
+        # que des centimes/jour. On prefere du deterministe.
         extracted = None
-        if (needs_llm_categorie or needs_llm_other) and self._llm is not None:
+        if self._llm is not None:
+            # Log INFO temporaire pour debugger en prod (incident 2026-05-10).
+            # A retirer une fois confirme que les calls Anthropic apparaissent
+            # bien dans la console (clef ANTHROPIC_API_KEY correcte cote Railway).
+            logger.info("[normalize] %s : extract() appele pour %s", self.source_nom, url)
             try:
                 extracted = self._llm.extract(
                     titre=titre,
