@@ -9,9 +9,13 @@ Reçoit le webhook Tally du formulaire 5BEkrv et :
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,6 +46,14 @@ AIRTABLE_LEADS_ESSAI_TABLE = os.getenv("AIRTABLE_LEADS_ESSAI_TABLE", "tbl5LfC0pU
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "contact@faillink.be")
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Faillink")
+
+# Stripe webhook (invoice.payment_failed -> migration de Make W8 vers Python)
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_CUSTOMER_PORTAL_URL = os.getenv("STRIPE_CUSTOMER_PORTAL_URL", "")
+# Table Clients (lookup par stripe_customer_id)
+AIRTABLE_CLIENTS_TABLE = os.getenv("CLIENTS_TABLE_ID", "tblFae1mWP3h1XOy1")
+# Tolerance anti-replay sur le timestamp de la signature Stripe (±5 min)
+STRIPE_SIGNATURE_TOLERANCE_SECONDS = 300
 
 AIRTABLE_API = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 BREVO_API = "https://api.brevo.com/v3"
@@ -164,6 +176,34 @@ def search_annonces(categories: list, pays: list, max_results: int = 5) -> list:
     except requests.RequestException as e:
         logger.error("[search_annonces] erreur Airtable : %s", e)
         return []
+
+
+def find_client_by_stripe_customer_id(cus_id: str) -> Optional[dict]:
+    """Cherche un client Airtable par stripe_customer_id.
+
+    Retourne le record (dict avec 'id' et 'fields') ou None si introuvable
+    / erreur reseau. Le caller decide quoi faire en cas de None
+    (typiquement : log + return 200 OK pour eviter retry Stripe inutile).
+    """
+    if not cus_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{AIRTABLE_API}/{AIRTABLE_CLIENTS_TABLE}",
+            headers=airtable_headers(),
+            params={
+                "filterByFormula": f'{{stripe_customer_id}}="{cus_id}"',
+                "maxRecords": 1,
+                "fields[]": ["email", "prenom", "stripe_customer_id"],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("records", [])
+        return records[0] if records else None
+    except requests.RequestException as e:
+        logger.error("[stripe] find_client_by_stripe_customer_id(%s) : %s", cus_id, e)
+        return None
 
 
 def create_lead(lead_data: dict) -> Optional[str]:
@@ -298,6 +338,235 @@ def send_email_essai_simple(
 
 
 # ============================================================================
+# Helpers — Stripe payment_failed email
+# ============================================================================
+
+def build_payment_failed_email_html(
+    prenom: Optional[str],
+    amount_eur: float,
+    currency: str,
+    next_attempt_dt: Optional[datetime],
+    portal_url: str,
+) -> tuple[str, str]:
+    """Construit (subject, html) pour l'email d'echec de paiement.
+
+    Pure : pas d'I/O, facilement testable.
+    """
+    subject = "⚠️ Faillink — Échec de paiement de votre abonnement"
+    salutation = (
+        f"Bonjour {prenom.strip()},"
+        if prenom and prenom.strip()
+        else "Bonjour,"
+    )
+    amount_str = f"{amount_eur:.2f} {currency.upper()}"
+    if next_attempt_dt:
+        retry_line = (
+            "Stripe retentera automatiquement le "
+            f"{next_attempt_dt.strftime('%d/%m/%Y')}."
+        )
+    else:
+        retry_line = "Stripe retentera automatiquement dans les prochains jours."
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Échec de paiement Faillink</title></head>
+<body style="font-family: -apple-system, Helvetica, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+
+  <h1 style="color: #1a1a1a;">{salutation}</h1>
+
+  <p>Une tentative de paiement de <strong>{amount_str}</strong> pour votre abonnement Faillink a échoué.</p>
+
+  <p>{retry_line}</p>
+
+  <p style="margin: 24px 0; padding: 16px; background: #fef7e6; border-left: 4px solid #ffaa00; border-radius: 4px;">
+    Pas de panique, vos alertes continuent pendant environ 3 jours, le temps de mettre à jour votre paiement.
+  </p>
+
+  <div style="margin: 32px 0; text-align: center;">
+    <a href="{portal_url}" style="display: inline-block; background: #1a1a1a; color: white; padding: 14px 28px; border-radius: 6px; text-decoration: none; font-weight: 600;">
+      Mettre à jour ma carte bancaire
+    </a>
+  </div>
+
+  <p style="color: #999; font-size: 12px; margin-top: 32px;">
+    Faillink — Alertes B2B sur machines industrielles off-market en Europe<br>
+    Vous recevez cet email suite à un échec de paiement de votre abonnement.
+  </p>
+
+</body>
+</html>"""
+    return subject, html
+
+
+def send_payment_failed_email(
+    to_email: str,
+    prenom: Optional[str],
+    amount_eur: float,
+    currency: str,
+    next_attempt_dt: Optional[datetime],
+    portal_url: str,
+) -> bool:
+    """Envoie l'email d'echec de paiement via Brevo. Retourne True si OK."""
+    if not BREVO_API_KEY:
+        logger.warning("[stripe] BREVO_API_KEY absent — email NON envoye")
+        return False
+    subject, html = build_payment_failed_email_html(
+        prenom=prenom,
+        amount_eur=amount_eur,
+        currency=currency,
+        next_attempt_dt=next_attempt_dt,
+        portal_url=portal_url,
+    )
+    try:
+        resp = requests.post(
+            f"{BREVO_API}/smtp/email",
+            headers={
+                "api-key": BREVO_API_KEY,
+                "Content-Type": "application/json",
+                "accept": "application/json",
+            },
+            json={
+                "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+                "to": [{"email": to_email, "name": prenom or to_email}],
+                "subject": subject,
+                "htmlContent": html,
+            },
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            msg_id = resp.json().get("messageId", "?")
+            logger.info("[stripe] payment_failed envoye a %s (msgId=%s)", to_email, msg_id)
+            return True
+        logger.error(
+            "[stripe] Brevo HTTP %d pour %s : %s",
+            resp.status_code, to_email, resp.text[:300],
+        )
+        return False
+    except requests.RequestException as e:
+        logger.error("[stripe] erreur reseau Brevo pour %s : %s", to_email, e)
+        return False
+
+
+# ============================================================================
+# Helpers — Stripe signature verification + handler
+# ============================================================================
+
+def verify_stripe_signature(
+    payload: bytes,
+    sig_header: str,
+    secret: str,
+    tolerance_seconds: int = STRIPE_SIGNATURE_TOLERANCE_SECONDS,
+) -> bool:
+    """Verifie la signature Stripe selon la spec officielle.
+
+    Header format : `t=<timestamp>,v1=<sig>[,v0=<sig>]`
+    Signed payload : `f"{timestamp}.{body}"` en bytes.
+    Anti-replay : timestamp doit etre dans ±tolerance_seconds de maintenant.
+
+    Retourne True si valide, False sinon (signature invalide, replay, malforme).
+    """
+    if not sig_header or not secret or not payload:
+        return False
+    parts: dict = {}
+    for kv in sig_header.split(","):
+        k, _, v = kv.partition("=")
+        k, v = k.strip(), v.strip()
+        if k and v:
+            # Plusieurs v1=... possibles theoriquement, on garde le premier
+            parts.setdefault(k, v)
+    timestamp_str = parts.get("t")
+    sig_v1 = parts.get("v1")
+    if not timestamp_str or not sig_v1:
+        return False
+    try:
+        ts = int(timestamp_str)
+    except ValueError:
+        return False
+    # Anti-replay
+    if abs(int(time.time()) - ts) > tolerance_seconds:
+        return False
+    signed_payload = timestamp_str.encode("utf-8") + b"." + payload
+    expected = hmac.new(
+        secret.encode("utf-8"), signed_payload, hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig_v1)
+
+
+def handle_payment_failed(invoice_obj: dict, dry_run: bool = False) -> dict:
+    """Traite un evenement Stripe invoice.payment_failed.
+
+    Retourne un dict avec :
+        status : "ok" | "dry_run" | "skip" | "no_client" | "error"
+        + details specifiques.
+
+    Le caller (endpoint) doit mapper "error" + reason="brevo_failed"
+    vers un HTTP 500 (Stripe RETRY auto). Les autres statuts -> 200 OK.
+    """
+    cus_id = invoice_obj.get("customer")
+    amount_due_cents = invoice_obj.get("amount_due", 0) or 0
+    currency = invoice_obj.get("currency", "eur") or "eur"
+    next_attempt_ts = invoice_obj.get("next_payment_attempt")
+
+    if not cus_id:
+        logger.warning("[stripe] invoice sans customer id, skip")
+        return {"status": "skip", "reason": "no_customer_id"}
+
+    client = find_client_by_stripe_customer_id(cus_id)
+    if not client:
+        logger.warning(
+            "[stripe] client %s introuvable dans Airtable, skip (no retry)",
+            cus_id,
+        )
+        return {"status": "no_client", "stripe_customer_id": cus_id}
+
+    fields = client.get("fields", {})
+    to_email = fields.get("email")
+    prenom = fields.get("prenom")
+    if not to_email:
+        logger.error("[stripe] client %s sans email", cus_id)
+        return {"status": "error", "reason": "client_has_no_email"}
+
+    amount_eur = amount_due_cents / 100.0
+    next_attempt_dt = (
+        datetime.fromtimestamp(next_attempt_ts, tz=timezone.utc)
+        if next_attempt_ts else None
+    )
+
+    if not STRIPE_CUSTOMER_PORTAL_URL:
+        logger.error(
+            "[stripe] STRIPE_CUSTOMER_PORTAL_URL absent — bouton CTA cassé, skip envoi",
+        )
+        return {"status": "error", "reason": "portal_url_not_configured"}
+
+    if dry_run:
+        logger.info(
+            "[stripe] DRY-RUN : would send to %s (amount=%.2f %s, next=%s)",
+            to_email, amount_eur, currency,
+            next_attempt_dt.isoformat() if next_attempt_dt else "n/a",
+        )
+        return {
+            "status": "dry_run",
+            "to": to_email,
+            "prenom": prenom,
+            "amount_eur": amount_eur,
+            "currency": currency,
+            "next_attempt": next_attempt_dt.isoformat() if next_attempt_dt else None,
+        }
+
+    sent = send_payment_failed_email(
+        to_email=to_email,
+        prenom=prenom,
+        amount_eur=amount_eur,
+        currency=currency,
+        next_attempt_dt=next_attempt_dt,
+        portal_url=STRIPE_CUSTOMER_PORTAL_URL,
+    )
+    if sent:
+        return {"status": "ok", "to": to_email}
+    return {"status": "error", "reason": "brevo_failed"}
+
+
+# ============================================================================
 # FastAPI app
 # ============================================================================
 app = FastAPI(title="Faillink Funnel Essai")
@@ -404,6 +673,52 @@ async def tally_webhook(request: Request):
             "email_sent": email_sent,
         },
     )
+
+
+@app.post("/webhook/stripe/payment-failed")
+async def stripe_payment_failed(request: Request):
+    """Endpoint webhook Stripe pour invoice.payment_failed (remplace Make W8).
+
+    Comportement HTTP :
+      - signature absente / invalide / replay -> 400 (Stripe ne retry pas)
+      - event != invoice.payment_failed       -> 200 (ignore proprement)
+      - client introuvable                    -> 200 (Stripe ne retry pas)
+      - Brevo fail                            -> 500 (Stripe RETRY auto)
+      - succes                                -> 200
+    """
+    body = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("[stripe] STRIPE_WEBHOOK_SECRET absent — config Railway manquante")
+        raise HTTPException(status_code=500, detail="webhook not configured")
+
+    if not verify_stripe_signature(body, sig, STRIPE_WEBHOOK_SECRET):
+        logger.warning("[stripe] signature invalide ou replay")
+        raise HTTPException(status_code=400, detail="invalid signature")
+
+    try:
+        event = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    event_type = event.get("type")
+    event_id = event.get("id", "?")
+    if event_type != "invoice.payment_failed":
+        logger.info("[stripe] event %s (%s) ignore", event_type, event_id)
+        return {"status": "ignored", "type": event_type, "event_id": event_id}
+
+    invoice_obj = event.get("data", {}).get("object", {}) or {}
+    result = handle_payment_failed(invoice_obj)
+    result["event_id"] = event_id
+
+    # Brevo fail -> 500 pour declencher le retry Stripe.
+    # Tous les autres statuts -> 200 (Stripe ne retry pas).
+    if result.get("status") == "error" and result.get("reason") == "brevo_failed":
+        logger.error("[stripe] Brevo fail pour event %s, return 500 pour retry", event_id)
+        raise HTTPException(status_code=500, detail="email send failed, retry me")
+
+    return result
 
 
 # Point d'entrée pour exécution directe (test local)
