@@ -62,10 +62,36 @@ Dans `config.py`, ajouter un bloc dans la liste `SOURCES` :
 
 ## Déploiement Railway
 
+Le repo alimente 4 services Railway distincts :
+
+| Service | Source | Cron | Rôle |
+|---|---|---|---|
+| `machine-alert-scraper` | `python main.py` (Procfile worker) | `0 2 * * *` | Scrape les sites, push annonces |
+| `machine-alert-scraper` (web) | `uvicorn webhook_server:app` | — | Webhook Tally funnel essai |
+| `lifecycle-worker` | `python scripts/update_annonce_statuts.py` | `30 3 * * *` | Recalcule `statut_annonce` quotidien |
+| `alertes-worker` | `python scripts/send_daily_alerts.py` | `0 10 * * *` | Envoie les emails d'alerte aux clients actifs |
+
 1. Push sur GitHub
-2. Créer un projet Railway depuis le repo
-3. Ajouter les variables d'environnement dans Railway → Settings → Variables
-4. Configurer un **Cron** : `0 2 * * *` (chaque nuit à 02h00)
+2. Créer chaque service Railway depuis le repo (4 services partagent le même repo)
+3. Ajouter les variables d'environnement dans Railway → Settings → Variables (les 4 services partagent `AIRTABLE_TOKEN`, `ANTHROPIC_API_KEY`, `BREVO_API_KEY`)
+4. Configurer le **Cron schedule** sur chaque service worker (voir tableau)
+
+## Service `alertes-worker` — alertes quotidiennes clients
+
+Remplace l'ancienne automation Make "W7" (abandonnée 2026-05-11).
+
+```bash
+# Test local sans écrire ni envoyer
+python scripts/send_daily_alerts.py --dry-run --verbose
+
+# Limiter à 1 client (debug)
+python scripts/send_daily_alerts.py --dry-run --limit 1 --verbose
+
+# Tests unitaires de la fonction de matching
+python tests/test_send_daily_alerts.py
+```
+
+Logique : pour chaque client `actif=true`, intersection `client.pays ∩ annonce.pays` + `client.categories ∩ annonce.categorie` sur les annonces des dernières 24h non encore envoyées. Top 3 dans l'email Brevo, lien `app.faillink.be` pour les autres. PATCH `alerte_envoyee=true` SEULEMENT si Brevo a confirmé l'envoi (anti-doublon).
 
 ## Commandes utiles
 

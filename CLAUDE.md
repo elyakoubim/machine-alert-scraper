@@ -4,12 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Big picture
 
-The repo runs two unrelated processes against the same Airtable base (`appQrNOm3Q7D9uEed`):
+The repo runs four unrelated processes against the same Airtable base (`appQrNOm3Q7D9uEed`):
 
-1. **Worker (`main.py`)** — auction/liquidation site scraper. Discovers v2 scrapers in `scrapers/sites/*.py`, runs each, pushes new annonces into the Airtable `Annonces` table, updates `Sources` row status. Designed to be run nightly via Railway cron.
+1. **Worker (`main.py`)** — auction/liquidation site scraper. Discovers v2 scrapers in `scrapers/sites/*.py`, runs each, pushes new annonces into the Airtable `Annonces` table, updates `Sources` row status. Railway cron `0 2 * * *` (02h UTC daily).
 2. **Web (`webhook_server.py`)** — FastAPI app that receives the Tally form webhook (free-trial funnel). It parses the lead, queries Airtable for matching annonces, sends a teaser email through Brevo, and creates a row in `Leads_Essai`. Runs as the `web` process on Railway.
+3. **Lifecycle worker (`scripts/update_annonce_statuts.py`)** — computes `statut_annonce` (active / expirant_24h / expirée / inconnu) from `date_fin` and `indexed_at`. Railway cron `30 3 * * *` (03h30 UTC daily).
+4. **Alertes worker (`scripts/send_daily_alerts.py`)** — sends a daily Brevo email to each active paying client with new annonces matching their pays/categories profile. Replaces the deprecated Make automation "W7". Railway cron `0 10 * * *` (10h UTC daily). Only writer of `alerte_envoyee` (via `airtable.mark_annonces_alerte_envoyee`).
 
-Both are deployed from the same Railway service; the `Procfile` defines `web` and `worker` separately.
+Worker and Web share the `Procfile` (web + worker processes). The two scripts run as their own Railway services with custom start commands.
 
 ## Common commands
 
@@ -73,7 +75,7 @@ When adding a category, update `CATEGORIES_FAILLINK`, the `LLMExtractor.SYSTEM_P
 
 ## Airtable safety rules
 
-- **Never write `alerte_envoyee` from Python.** This field is owned by a Make automation; writing it can re-fire alerts or cancel pending ones. `airtable.py:update_annonce_fields()` and `batch_update_annonces()` strip it defensively — don't bypass them.
+- **`alerte_envoyee` writes are restricted to ONE function.** The only writer is `airtable.mark_annonces_alerte_envoyee(record_ids)`, used by `scripts/send_daily_alerts.py` (the `alertes-worker` service). All other update paths (`update_annonce_fields()`, `batch_update_annonces()`) strip this field defensively — don't bypass them. Historical note: Make automation "W7" used to own this field, but was deprecated 2026-05-11 when the alert workflow was rebuilt in Python on Railway.
 - **Don't use `git add -A` for commits that touch `.env`.** `.env.example` is the only env file that should ever be tracked.
 - Push dedup: `airtable.py:push_annonces()` calls `get_existing_urls(source_nom)` first and filters out URLs already present, so re-running a scraper is safe and idempotent.
 - Table IDs in code (`tbljV9HICBsPyqjQk` for Annonces, `tblPaOrQekEMdaW5x` for Sources, `tblXhuS0M1TtRuSel` for Profils, `tbl5LfC0pUmt4rUJl` for Leads_Essai) can be overridden via env vars — the defaults in `airtable.py` and `webhook_server.py` are the production ones.

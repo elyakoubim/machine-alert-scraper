@@ -320,5 +320,48 @@ def batch_update_annonces(updates: list) -> dict:
     return {"updated": updated, "errors": errors, "total": len(cleaned)}
 
 
+def mark_annonces_alerte_envoyee(record_ids: list) -> dict:
+    """Marque une liste de records Annonces avec alerte_envoyee=True.
+
+    SEULE fonction du module autorisee a ecrire `alerte_envoyee`. Toutes les
+    autres fonctions de mise a jour (update_annonce_fields,
+    batch_update_annonces) strippent ce champ defensivement. Cette autorisation
+    explicite remplace l'ancienne automation Make W7 (abandonnee 2026-05-11
+    suite a la bascule vers le worker Python `alertes-worker`).
+
+    Retourne {"updated": M, "errors": E, "total": N}.
+    """
+    if not record_ids:
+        return {"updated": 0, "errors": 0, "total": 0}
+    updated = 0
+    errors = 0
+    for i in range(0, len(record_ids), 10):
+        batch_ids = record_ids[i:i + 10]
+        batch_records = [
+            {"id": rid, "fields": {"alerte_envoyee": True}}
+            for rid in batch_ids
+        ]
+        try:
+            resp = requests.patch(
+                f"{API_BASE}/{ANNONCES_TABLE}",
+                headers=_headers(),
+                json={"records": batch_records, "typecast": True},
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                updated += len(batch_records)
+            else:
+                errors += len(batch_records)
+                logger.error(
+                    "[airtable] mark_alerte_envoyee HTTP %d : %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except requests.RequestException as e:
+            errors += len(batch_records)
+            logger.error("[airtable] mark_alerte_envoyee erreur reseau : %s", e)
+        time.sleep(0.25)
+    return {"updated": updated, "errors": errors, "total": len(record_ids)}
+
+
 def _escape_formula_value(s: str) -> str:
     return (s or "").replace('"', "'")
