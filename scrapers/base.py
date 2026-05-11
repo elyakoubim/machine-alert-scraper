@@ -295,29 +295,50 @@ class BaseScraper(ABC):
 
     def run(self) -> Iterator[Annonce]:
         seen_urls = set()
-        for listing_url in self.list_listing_urls():
-            try:
-                html_listing = self.fetch(listing_url)
-            except Exception as e:
-                logger.warning(
-                    "[%s] echec fetch listing %s : %s",
-                    self.source_nom, listing_url, e,
-                )
-                continue
-            for detail_url in self.parse_listing(html_listing, listing_url):
-                if detail_url in seen_urls:
-                    continue
-                seen_urls.add(detail_url)
+        # Compteurs diagnostiques : detecter ou disparaissent les URLs entre
+        # parse_listing et le yield final (incident prod 2026-05-10/11 ou
+        # "16-22 lots trouves" par page mais 0 annonces collectees).
+        # Le try/finally garantit que le recap fire meme si main.py break early
+        # (ex: --max-annonces N) en fermant le generateur via GeneratorExit.
+        n_pages = 0
+        n_from_parse_listing = 0
+        n_after_seen_dedup = 0
+        n_yielded = 0
+        try:
+            for listing_url in self.list_listing_urls():
+                n_pages += 1
                 try:
-                    html_detail = self.fetch(detail_url)
-                    raw = self.parse_detail(html_detail, detail_url)
-                    yield self.normalize(raw, detail_url)
+                    html_listing = self.fetch(listing_url)
                 except Exception as e:
                     logger.warning(
-                        "[%s] echec parse %s : %s",
-                        self.source_nom, detail_url, e,
+                        "[%s] echec fetch listing %s : %s",
+                        self.source_nom, listing_url, e,
                     )
                     continue
+                for detail_url in self.parse_listing(html_listing, listing_url):
+                    n_from_parse_listing += 1
+                    if detail_url in seen_urls:
+                        continue
+                    seen_urls.add(detail_url)
+                    n_after_seen_dedup += 1
+                    try:
+                        html_detail = self.fetch(detail_url)
+                        raw = self.parse_detail(html_detail, detail_url)
+                        yield self.normalize(raw, detail_url)
+                        n_yielded += 1
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] echec parse %s : %s",
+                            self.source_nom, detail_url, e,
+                        )
+                        continue
+        finally:
+            logger.info(
+                "[%s] run() recap : pages=%d | from_parse_listing=%d | "
+                "after_seen_dedup=%d | yielded=%d",
+                self.source_nom, n_pages, n_from_parse_listing,
+                n_after_seen_dedup, n_yielded,
+            )
 
     def clean_text(self, text: Optional[str]) -> str:
         if not text:
