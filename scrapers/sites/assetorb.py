@@ -58,9 +58,13 @@ AUCTION_URL_PATTERN = re.compile(
 )
 
 # Pattern pour URLs lot
-# /auction/lot/1213-montageanlage/?lot=42675&au=715
+# Format reel observe (diag 12 mai 20h40) :
+# /auction/lot/{slug}/?lot={id}&so=0&st=&sto=0&au={au_id}&ef=&et=&ic=False&sd=0&pp=96&pn=1&g=1
+# On capture jusqu'a `&au=Y` inclus (= contexte auction probablement requis pour
+# que la page de detail renvoie du contenu utile). Tolere `&amp;` HTML-escape
+# (qu'on convertira en `&` avant yield).
 LOT_URL_PATTERN = re.compile(
-    r'(/auction/lot/[^"\'<>\s?]+/\?lot=\d+&au=\d+)',
+    r'(/auction/lot/[^"\'<>\s?]+/\?lot=\d+(?:&(?:amp;)?[^"&]*)*&(?:amp;)?au=\d+)',
     re.IGNORECASE,
 )
 
@@ -107,6 +111,22 @@ class AssetOrbScraper(BaseScraper):
     default_category = "Autre / non classe"
 
     def __init__(self, fetcher=None, llm_extractor=None):
+        # AssetOrb bloque les IPs datacenter (audit 12 mai : HTML vide en prod
+        # alors que fetch local Mohamed retourne le contenu). On route via
+        # ScraperAPI sans render : le HTML statique d'AssetOrb contient deja
+        # les lots (~643KB par page auction, confirme en diag 12 mai 20:36).
+        # Render JS n'est PAS necessaire (et causait des HTTP 500 timeout
+        # cote ScraperAPI sur le rendu lourd). Cout : 1 credit/req.
+        if fetcher is None:
+            try:
+                from scrapers.fetchers import ScraperApiFetcher
+                fetcher = ScraperApiFetcher()
+            except ValueError as e:
+                logger.warning(
+                    "[AssetOrb] ScraperApiFetcher indisponible (%s), "
+                    "fallback HttpxFetcher (sera probablement bloque en prod)",
+                    e,
+                )
         super().__init__(fetcher=fetcher, llm_extractor=llm_extractor)
         self._existing_urls = None
         # Cache : URLs des auctions decouvertes
@@ -195,9 +215,11 @@ class AssetOrbScraper(BaseScraper):
                     )
                     self._existing_urls = set()
 
-            # Yield seulement les nouvelles URLs
+            # Yield seulement les nouvelles URLs. Le HTML contient `&amp;`
+            # (HTML entity), il faut le convertir en `&` pour que httpx/AssetOrb
+            # interprete correctement les query params.
             for path in unique_paths:
-                full_url = BASE_URL + path
+                full_url = BASE_URL + path.replace("&amp;", "&")
                 if full_url not in self._existing_urls:
                     yield full_url
 

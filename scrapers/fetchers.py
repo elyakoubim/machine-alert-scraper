@@ -145,14 +145,29 @@ class PlaywrightFetcher:
 # ============================================================
 
 class ScraperApiFetcher:
-    """Fetcher via ScraperAPI (proxy anti-bot)."""
+    """Fetcher via ScraperAPI (proxy anti-bot).
 
-    def __init__(self, api_key: Optional[str] = None, timeout: int = 60, render_js: bool = False):
+    Params optionnels :
+        render_js          : execute le JS cote serveur ScraperAPI (10-25x credits).
+        wait_for_selector  : CSS selector a attendre apres render JS (ex.
+                             "a[href*='lo=']" pour AssetOrb). ScraperAPI attend
+                             jusqu'a l'apparition du selecteur ou son timeout
+                             interne. Inutile si render_js=False.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        timeout: int = 120,
+        render_js: bool = False,
+        wait_for_selector: Optional[str] = None,
+    ):
         self.api_key = api_key or os.getenv("SCRAPERAPI_KEY", "")
         if not self.api_key:
             raise ValueError("SCRAPERAPI_KEY manquante (env var ou param)")
         self.timeout = timeout
         self.render_js = render_js
+        self.wait_for_selector = wait_for_selector
         self.base_url = "https://api.scraperapi.com/"
 
     def fetch(self, url: str) -> str:
@@ -162,6 +177,9 @@ class ScraperApiFetcher:
         }
         if self.render_js:
             params["render"] = "true"
+            # wait_for_selector ne s'applique que sur render JS
+            if self.wait_for_selector:
+                params["wait_for_selector"] = self.wait_for_selector
 
         with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
             r = client.get(self.base_url, params=params)
