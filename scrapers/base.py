@@ -327,10 +327,23 @@ class BaseScraper(ABC):
                         yield self.normalize(raw, detail_url)
                         n_yielded += 1
                     except Exception as e:
-                        logger.warning(
-                            "[%s] echec parse %s : %s",
-                            self.source_nom, detail_url, e,
+                        # 500 server error -> log INFO discret (cas Lueders : 17/22
+                        # detail URLs renvoient 500 systematique, pas notre faute).
+                        # Duck-typing pour rester agnostique de la lib HTTP utilisee
+                        # (httpx ou requests) : on lit .response.status_code si dispo.
+                        status_code = getattr(
+                            getattr(e, "response", None), "status_code", None,
                         )
+                        if status_code == 500:
+                            logger.info(
+                                "[%s] 500 server error sur %s (skip silencieux)",
+                                self.source_nom, detail_url,
+                            )
+                        else:
+                            logger.warning(
+                                "[%s] echec parse %s : %s",
+                                self.source_nom, detail_url, e,
+                            )
                         continue
         finally:
             logger.info(
