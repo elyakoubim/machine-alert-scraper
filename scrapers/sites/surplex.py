@@ -112,6 +112,23 @@ class SurplexScraper(BaseScraper):
     default_category = "Autre / non classe"
 
     def __init__(self, fetcher=None, llm_extractor=None):
+        # Surplex bloque les IPs datacenter (audit 12 mai : HTML vide en prod
+        # Railway alors que fetch local Mohamed retourne 48 uniques). On route
+        # via ScraperAPI (proxy IPs residentielles). render_js=False (defaut) :
+        # HTML statique, 1 credit/req au lieu de 10-25.
+        if fetcher is None:
+            try:
+                from scrapers.fetchers import ScraperApiFetcher
+                fetcher = ScraperApiFetcher()
+            except ValueError as e:
+                # Cle SCRAPERAPI absente -> fallback HttpxFetcher (default base.py).
+                # Le scraper retournera probablement 0 en prod datacenter, mais
+                # au moins on ne crashe pas le worker.
+                logger.warning(
+                    "[Surplex] ScraperApiFetcher indisponible (%s), "
+                    "fallback HttpxFetcher (sera probablement bloque en prod)",
+                    e,
+                )
         super().__init__(fetcher=fetcher, llm_extractor=llm_extractor)
         self._existing_urls = None
         # Cache: liste des URLs d'auctions découvertes
