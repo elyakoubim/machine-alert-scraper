@@ -101,7 +101,10 @@ class RockmannScraper(BaseScraper):
     source_nom = "Rockmann Industrieauktionen"
     source_pays = "DE"
     base_url = BASE_URL
-    requires_javascript = False  # HTML statique
+    # Bidpath platform sert un challenge JS (HTTP 202 + stub 2108 chars) en
+    # httpx pur. Playwright execute le challenge et recoit le vrai HTML.
+    # Meme constat que Hämmerle (Bidpath = white-label commun).
+    requires_javascript = True
     rate_limit_seconds = 1.0
     default_category = "Autre / non classe"
 
