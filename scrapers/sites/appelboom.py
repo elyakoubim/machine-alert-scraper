@@ -86,6 +86,14 @@ MAX_PAGES_PER_VEILING = 50
 # Limite de sécurité : nb max de veilingen
 MAX_VEILINGEN = 30
 
+# Early-stop pagination : si N pages consecutives produisent 0 nouveau lot
+# (toutes URLs deja connues en Airtable), on saute le reste de la veiling.
+# Trade-off : si Appelboom mettait des nouveaux lots a la FIN de la pagination
+# (peu probable pour un site auction, generalement tri par date desc), on les
+# raterait. Compromis 2 = tolere 1 page vide isolee, mais stop apres confirmation.
+# Audit 12 mai : 551 pages fetched pour 2 nouvelles annonces (98% gaspillage).
+ZERO_NEW_PAGE_THRESHOLD = 2
+
 
 class AppelboomScraper(BaseScraper):
     source_nom = "Appelboom"
@@ -100,6 +108,10 @@ class AppelboomScraper(BaseScraper):
         self._existing_urls = None
         # Cache: liste des veiling_ids decouverts depuis la homepage
         self._veiling_ids: Optional[list] = None
+        # Early-stop : pages consecutives sans nouveau lot, par veiling_id
+        self._zero_new_streak: dict = {}
+        # Veilingen "epuisees" (early-stop active) : on saute le reste
+        self._exhausted_veilingen: set = set()
 
     def list_listing_urls(self) -> Iterator[str]:
         """Genere les URLs des pages liste (homepage + pages kavels paginees).
@@ -122,6 +134,15 @@ class AppelboomScraper(BaseScraper):
 
         for veiling_id in self._veiling_ids[:MAX_VEILINGEN]:
             for page in range(1, MAX_PAGES_PER_VEILING + 1):
+                # Early-stop : si parse_listing a marque cette veiling comme
+                # epuisee (N pages consecutives sans nouveau lot), on skip
+                # le reste de sa pagination.
+                if veiling_id in self._exhausted_veilingen:
+                    logger.info(
+                        "[%s] veiling %s : early-stop apres page %d",
+                        self.source_nom, veiling_id, page - 1,
+                    )
+                    break
                 if page == 1:
                     yield f"{BASE_URL}/Alle-kavels/{veiling_id}/Veiling"
                 else:
@@ -180,11 +201,33 @@ class AppelboomScraper(BaseScraper):
                 )
                 self._existing_urls = set()
 
-        # Yield seulement les nouvelles URLs
+        # Yield seulement les nouvelles URLs, et tient le compteur early-stop.
+        new_count = 0
         for path in unique_paths:
             full_url = BASE_URL + path
             if full_url not in self._existing_urls:
                 yield full_url
+                new_count += 1
+
+        # Update early-stop : extrait le veiling_id de l'URL de listing
+        # (pattern /Alle-kavels/{veiling_id}/Veiling).
+        m = VEILING_URL_PATTERN.search(listing_url)
+        if m:
+            veiling_id = m.group(1)
+            if new_count == 0:
+                streak = self._zero_new_streak.get(veiling_id, 0) + 1
+                self._zero_new_streak[veiling_id] = streak
+                if streak >= ZERO_NEW_PAGE_THRESHOLD:
+                    self._exhausted_veilingen.add(veiling_id)
+                    logger.info(
+                        "[%s] veiling %s : %d pages consecutives sans nouveau lot, "
+                        "early-stop active (reste de la pagination skippe)",
+                        self.source_nom, veiling_id, streak,
+                    )
+            else:
+                # Reset le streak si on a trouve du nouveau
+                if self._zero_new_streak.get(veiling_id):
+                    self._zero_new_streak[veiling_id] = 0
 
     def parse_detail(self, html: str, url: str) -> dict:
         """Parse une page kavel et retourne un dict avec les champs raw.
