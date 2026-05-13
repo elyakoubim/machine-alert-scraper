@@ -70,12 +70,15 @@ logger = logging.getLogger("backfill_haiku_2026_05_13")
 # Bornes session
 SESSION_START_ISO = "2026-05-13T00:00:00Z"
 # IS_AFTER est strict : on borne juste avant pour obtenir >= 00:00:00Z.
-FILTER_FORMULA = (
+FILTER_FORMULA_WITH_DATE = (
     "AND("
     "NOT({categorie}), "
     "IS_AFTER({indexed_at}, '2026-05-12T23:59:59.999Z')"
     ")"
 )
+# Variante "no-date-filter" : ramene TOUTES les annonces sans categorie,
+# toutes dates confondues. Pour rattraper du backlog legacy via --no-date-filter.
+FILTER_FORMULA_NO_DATE = "NOT({categorie})"
 
 # Taille de lot pour l'extraction LLM (matchee a MAX_BATCH_SIZE de extract_batch)
 BATCH_SIZE = 20
@@ -102,16 +105,26 @@ CONDITIONAL_FIELDS = ("marque", "modele", "annee_fabrication", "etat", "type_ven
 # Airtable I/O
 # =============================================================================
 
-def fetch_candidates(limit: Optional[int] = None) -> list:
-    """Recupere les annonces session sans categorie depuis Airtable."""
-    logger.info("[backfill] fetch : filtre = %s", FILTER_FORMULA)
+def fetch_candidates(
+    limit: Optional[int] = None,
+    no_date_filter: bool = False,
+) -> list:
+    """Recupere les annonces sans categorie depuis Airtable.
+
+    `no_date_filter=True` ramene tout le backlog historique au lieu de
+    juste la fenetre de la session 2026-05-13.
+    """
+    formula = FILTER_FORMULA_NO_DATE if no_date_filter else FILTER_FORMULA_WITH_DATE
+    logger.info("[backfill] fetch : filtre = %s", formula)
     records = airtable.list_all_annonces(
         fields=FIELDS_TO_FETCH,
-        filter_formula=FILTER_FORMULA,
+        filter_formula=formula,
     )
+    total_match = len(records)
+    logger.info("[backfill] %d candidats matchent le filtre (avant --limit)", total_match)
     if limit:
         records = records[:limit]
-        logger.info("[backfill] limit applique : %d records", limit)
+        logger.info("[backfill] --limit applique : %d records traites sur %d", limit, total_match)
     logger.info("[backfill] %d candidats a traiter", len(records))
     return records
 
@@ -155,6 +168,7 @@ def build_patch_fields(current_fields: dict, extracted: dict) -> dict:
 def run_backfill(
     dry_run: bool = False,
     limit: Optional[int] = None,
+    no_date_filter: bool = False,
 ) -> dict:
     """Execute le backfill.
 
@@ -162,11 +176,11 @@ def run_backfill(
     """
     start = time.time()
     logger.info(
-        "[backfill] start dry_run=%s limit=%s batch_size=%d",
-        dry_run, limit, BATCH_SIZE,
+        "[backfill] start dry_run=%s limit=%s no_date_filter=%s batch_size=%d",
+        dry_run, limit, no_date_filter, BATCH_SIZE,
     )
 
-    records = fetch_candidates(limit=limit)
+    records = fetch_candidates(limit=limit, no_date_filter=no_date_filter)
     checked = len(records)
     if checked == 0:
         suffix = " (DRY-RUN)" if dry_run else ""
@@ -302,7 +316,7 @@ def run_backfill(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="One-shot backfill Haiku pour la session 2026-05-13",
+        description="One-shot backfill Haiku (session 2026-05-13 ou backlog legacy)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -311,6 +325,10 @@ def main() -> int:
     parser.add_argument(
         "--limit", type=int, default=None,
         help="Limite N records (utile pour tests)",
+    )
+    parser.add_argument(
+        "--no-date-filter", action="store_true",
+        help="Ignore la borne 2026-05-13 et ramene TOUS les records sans categorie (legacy catchup)",
     )
     parser.add_argument(
         "--verbose", action="store_true",
@@ -326,6 +344,7 @@ def main() -> int:
         result = run_backfill(
             dry_run=args.dry_run,
             limit=args.limit,
+            no_date_filter=args.no_date_filter,
         )
     except Exception as e:
         logger.error("[backfill] FATAL : %s", e, exc_info=True)
