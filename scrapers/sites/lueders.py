@@ -70,11 +70,18 @@ LOT_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Pattern pour images CDN Lueders
-# https://auktionen.lueders-partner.com/auktionsdaten/02618/00366.jpg
-# https://auktionen.lueders-partner.com/auktionsdaten/02618/00366-th.jpg (thumbnail)
+# Pattern pour images CDN Lueders.
+# Le HTML expose des URLs RELATIVES dans les <img src=...> :
+#   /auktionsdaten/02430/00027-no.jpg     <- full size original
+#   /auktionsdaten/02430/00027-th.jpg     <- thumbnail
+#   /auktionsdaten/02430/00027-1-th.jpg   <- variante numerotee thumbnail
+#   /auktionsdaten/02430/00027.jpg        <- defensif (pas observe en pratique)
+# Le prefix https://auktionen.lueders-partner.com est OPTIONNEL et NON capture ;
+# le capture group 1 contient toujours le path (qui commence par /). Le code
+# prefixe avec BASE_URL pour obtenir l'URL absolue.
 IMAGE_PATTERN = re.compile(
-    r'(https?://auktionen\.lueders-partner\.com/auktionsdaten/\d+/\d+(?:-th)?\.jpg)',
+    r'(?:https?://auktionen\.lueders-partner\.com)?'
+    r'(/auktionsdaten/\d+/\d+[^\s"\'<>]*\.jpg)',
     re.IGNORECASE,
 )
 
@@ -253,18 +260,26 @@ class LuedersScraper(BaseScraper):
                 if " | " in titre:
                     titre = titre.split(" | ")[0]
 
-        # === Image : depuis le CDN auktionsdaten/0{auction_id}/0{lot_id}.jpg ===
-        # On cherche d'abord la full size (sans -th), puis fallback thumbnail
+        # === Image : path CDN extrait via regex + prefix BASE_URL ===
+        # Le regex ramene toujours un path relatif (capture group 1).
+        # Priorite : -no.jpg (full size original) > pas de suffixe > -th.jpg
+        # (thumbnail) > variantes numerotees -N-th.jpg.
+        # Avant : regex exigeait URL absolue + ne couvrait pas -no, 100% des
+        # 5 327 records Lueders avaient image_url vide.
         image_url = ""
-        all_images = IMAGE_PATTERN.findall(html)
-        # Préférer image full size
-        for img in all_images:
-            if "-th" not in img:
-                image_url = img
-                break
-        # Fallback : thumbnail
-        if not image_url and all_images:
-            image_url = all_images[0]
+        all_image_paths = IMAGE_PATTERN.findall(html)
+        if all_image_paths:
+            def _img_rank(path: str) -> int:
+                p = path.lower()
+                if "-no.jpg" in p:
+                    return 0  # full size original
+                if re.search(r"/\d+\.jpg$", p):
+                    return 1  # sans suffixe (defensif, rarement vu)
+                if "-th.jpg" in p:
+                    return 2  # thumbnail simple ou numerote (-N-th.jpg)
+                return 3
+            chosen_path = sorted(all_image_paths, key=_img_rank)[0]
+            image_url = BASE_URL + chosen_path
 
         # === Description : conteneur .ak-posinfo (lot-specific) ===
         # .ak-posinfo isole la description du lot (titre, prix, fabrikat,
