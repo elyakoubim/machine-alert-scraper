@@ -15,6 +15,7 @@ CHANGEMENTS PAR RAPPORT À LA VERSION PRÉCÉDENTE :
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import re
 import time
@@ -193,8 +194,10 @@ class BaseScraper(ABC):
         return html
 
     def normalize(self, raw: dict, url: str) -> Annonce:
-        titre = (raw.get("titre") or "").strip()
-        description = (raw.get("description") or "").strip()
+        # Decode HTML entities (&nbsp;, &amp;, &quot;, numeric refs) defensively
+        # for every scraper. Idempotent on already-decoded strings.
+        titre = html.unescape(raw.get("titre") or "").strip()
+        description = html.unescape(raw.get("description") or "").strip()
         prix = (raw.get("prix") or raw.get("prix_brut") or "").strip()
         image_url = (raw.get("image_url") or "").strip()
         type_vente_raw = (raw.get("type_vente") or "").strip()
