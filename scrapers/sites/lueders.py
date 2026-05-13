@@ -36,6 +36,7 @@ dans une des 8 categories Faillink officielles.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import re
 from typing import Iterator, Optional
@@ -236,11 +237,14 @@ class LuedersScraper(BaseScraper):
         """
         soup = BeautifulSoup(html, "html.parser")
 
-        # === Titre : h1 prioritaire, sinon title ===
-        h1 = soup.find("h1")
+        # === Titre : h2 (Lueders met le titre du lot dans h2, pas h1) ===
+        # Aucun <h1> sur les pages lot ; <title> retourne "Alle Auktionen |
+        # Lueders & Partner GmbH" (titre du template Joomla), ce qui faisait
+        # historiquement que 100% des records avaient titre="Alle Auktionen".
+        h2 = soup.find("h2")
         titre = ""
-        if h1:
-            titre = self.clean_text(h1.get_text())
+        if h2:
+            titre = self.clean_text(h2.get_text())
         if not titre:
             title_tag = soup.find("title")
             if title_tag:
@@ -262,21 +266,22 @@ class LuedersScraper(BaseScraper):
         if not image_url and all_images:
             image_url = all_images[0]
 
-        # === Description : meta description + body text ===
+        # === Description : conteneur .ak-posinfo (lot-specific) ===
+        # .ak-posinfo isole la description du lot (titre, prix, fabrikat,
+        # baujahr, beschreibung) sans inclure le cookie banner, la nav,
+        # ou le footer. Confirme sur 4 samples (3 fermes + 1 actif).
+        # Avant : body.get_text() captait le cookie banner allemand
+        # ("Hinweis schliessen / verwendet Cookies"), polluant 100% des records.
         description = ""
-        meta_desc = soup.find("meta", attrs={"name": "description"})
-        if meta_desc:
-            description = (meta_desc.get("content", "") or "").strip()
-
-        # Enrichir avec body si description courte
-        if len(description) < 100 and soup.body:
-            for tag in soup.body.find_all(
-                ["script", "style", "nav", "footer", "header"]
-            ):
-                tag.decompose()
-            body_text = self.clean_text(soup.body.get_text())[:1500]
-            if body_text:
-                description = (description + " " + body_text).strip()[:2000]
+        posinfo = soup.select_one(".ak-posinfo")
+        if posinfo:
+            description = self.clean_text(posinfo.get_text(" "))[:2000]
+        if not description:
+            # Fallback defensif : meta description (~"Auktionen" en general,
+            # rarement informative mais non polluante).
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            if meta_desc:
+                description = (meta_desc.get("content", "") or "").strip()
 
         # === Prix : essayer plusieurs patterns ===
         prix = ""
@@ -316,6 +321,19 @@ class LuedersScraper(BaseScraper):
             auction_id, lot_id, _ = url_match.groups()
             source_id = f"{auction_id}-{lot_id}"
 
+        # === Auktionsstatus : detection pour lifecycle-worker ===
+        # Si "Auktionsstatus: abgeschlossen" est present, l'auction est
+        # terminee. On set date_fin = now() pour que update_annonce_statuts.py
+        # marque l'annonce en "expiree" au prochain run quotidien (03h30 UTC).
+        # Pour les autres statuts (aktiv, etc.) on laisse date_fin a None
+        # (peut etre raffine plus tard en parsant "Gebote bis ..." pour les actifs).
+        date_fin = None
+        status_match = re.search(
+            r"Auktionsstatus[:\s]+([a-zA-ZäöüÄÖÜß]+)", html
+        )
+        if status_match and status_match.group(1).lower() == "abgeschlossen":
+            date_fin = datetime.now(timezone.utc).isoformat()
+
         # === categorie_native : laissé vide pour Haiku ===
         categorie_native = None
 
@@ -327,6 +345,7 @@ class LuedersScraper(BaseScraper):
             "type_vente": type_vente,
             "categorie_native": categorie_native,
             "source_id": source_id,
+            "date_fin": date_fin,
             # pays par défaut = DE (source_pays de la classe)
         }
 
