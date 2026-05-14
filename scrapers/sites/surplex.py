@@ -29,8 +29,10 @@ dans une des 8 categories Faillink officielles.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from bs4 import BeautifulSoup
@@ -99,7 +101,12 @@ SUPPORTED_COUNTRIES = {
 
 # Limites de sécurité
 MAX_AUCTION_LIST_PAGES = 15  # Pagination /auctions (réel ~7)
-MAX_PAGES_PER_AUCTION = 30   # Pagination interne d'une auction
+# Pagination interne d'une auction. 100 pages * 48 lots/page = 4800 lots max,
+# marge confortable au-dela des plus grosses auctions Surplex observees
+# (~1500-1600 lots type Mounting Systems). En mode hybride niveau 2, on
+# stoppe tot via __NEXT_DATA__.lots.hasNext=False, cette limite est juste
+# un garde-fou anti-runaway.
+MAX_PAGES_PER_AUCTION = 100
 MAX_AUCTIONS = 200           # Garde-fou nb total auctions
 
 
@@ -354,3 +361,249 @@ class SurplexScraper(BaseScraper):
         if not text:
             return ""
         return re.sub(r"\s+", " ", text).strip()
+
+    # ================================================================
+    # Mode hybride niveau 2 : extraction depuis __NEXT_DATA__
+    # ================================================================
+
+    def _parse_auction_json(
+        self, html: str, url: str,
+    ) -> Optional[tuple]:
+        """Extrait la liste de lots depuis le JSON __NEXT_DATA__ d'une page
+        auction.
+
+        Retourne :
+            tuple (results, has_next, total_size) si JSON OK :
+                - results : list[dict] (peut etre vide en fin de pagination)
+                - has_next : bool depuis lots.hasNext
+                - total_size : int depuis lots.totalSize (0 si absent)
+            None si JSON absent / schema cassé → caller doit fallback
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        tag = soup.find("script", id="__NEXT_DATA__")
+        if not tag or not tag.string:
+            logger.warning(
+                "[%s] __NEXT_DATA__ absent sur %s, fallback regex",
+                self.source_nom, url,
+            )
+            return None
+        try:
+            data = json.loads(tag.string)
+            lots_block = data["props"]["pageProps"]["lots"]
+            results = lots_block["results"]
+            if not isinstance(results, list):
+                logger.warning(
+                    "[%s] __NEXT_DATA__.lots.results pas une liste sur %s",
+                    self.source_nom, url,
+                )
+                return None
+            has_next = bool(lots_block.get("hasNext"))
+            total_size = int(lots_block.get("totalSize") or 0)
+            return results, has_next, total_size
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning(
+                "[%s] __NEXT_DATA__ schema inattendu sur %s : %s",
+                self.source_nom, url, e,
+            )
+            return None
+
+    def _lot_to_raw(self, lot: dict) -> tuple:
+        """Convertit un objet lot JSON en (raw_dict, url) compatible avec
+        BaseScraper.normalize().
+
+        Retourne (None, None) si lot mal-forme (pas d'urlSlug).
+        """
+        url_slug = (lot.get("urlSlug") or "").strip()
+        if not url_slug:
+            return None, None
+        url = f"{BASE_URL}/l/{url_slug}"
+
+        titre = (lot.get("title") or "").strip()
+        description = (lot.get("description") or "").strip()
+
+        # Image (premiere taille dispo via le champ JSON, pas de variantes)
+        image_url = ""
+        image_obj = lot.get("image")
+        if isinstance(image_obj, dict):
+            image_url = (image_obj.get("url") or "").strip()
+
+        # Prix : currentBidAmount.cents / 100 -> "EUR 33,000"
+        prix = ""
+        bid = lot.get("currentBidAmount")
+        if isinstance(bid, dict):
+            cents = bid.get("cents")
+            currency = bid.get("currency") or "EUR"
+            if isinstance(cents, (int, float)) and cents > 0:
+                amount = cents / 100
+                if amount == int(amount):
+                    prix = f"{currency} {int(amount):,}"
+                else:
+                    prix = f"{currency} {amount:,.2f}"
+
+        # Pays : countryCode (lowercase ISO-2) -> uppercase
+        pays = ""
+        location = lot.get("location")
+        if isinstance(location, dict):
+            cc = (location.get("countryCode") or "").upper()
+            if cc in SUPPORTED_COUNTRIES:
+                pays = cc
+
+        # date_fin : endDate (epoch UTC) -> ISO 8601
+        date_fin = None
+        end_epoch = lot.get("endDate")
+        if isinstance(end_epoch, (int, float)) and end_epoch > 0:
+            try:
+                date_fin = datetime.fromtimestamp(
+                    end_epoch, tz=timezone.utc,
+                ).isoformat()
+            except (ValueError, OSError):
+                pass
+
+        source_id = (lot.get("displayId") or "").strip()
+
+        raw = {
+            "titre": titre,
+            "description": description,
+            "prix": prix,
+            "image_url": image_url,
+            "type_vente": "Enchere industrielle",
+            "categorie_native": None,
+            "source_id": source_id,
+            "pays": pays or "EU",
+            "date_fin": date_fin,
+        }
+        return raw, url
+
+    def run(self) -> Iterator[Annonce]:
+        """Mode hybride niveau 2 : parse les lots depuis __NEXT_DATA__ JSON
+        sur les pages d'auction. Pas de fetch niveau 3 par defaut.
+
+        - Page /auctions (index) : memoize les auction URLs (inchangé).
+        - Page /a/... avec JSON OK : extraction directe + yield Annonces.
+        - Page /a/... avec JSON cassé : fallback pipeline standard
+          (parse_listing -> fetch detail -> parse_detail).
+
+        Pagination : on stoppe les pages d'une auction des que has_next=False
+        (early stop sur __NEXT_DATA__.lots.hasNext). MAX_PAGES_PER_AUCTION
+        reste un garde-fou anti-runaway.
+        """
+        seen_urls: set = set()
+        completed_auctions: set = set()
+        n_pages = 0
+        n_lots_from_json = 0
+        n_fallback_lots = 0
+        n_yielded = 0
+        try:
+            for listing_url in self.list_listing_urls():
+                # Early-stop : skip les pages d'une auction deja completee
+                if "/a/" in listing_url:
+                    auction_prefix = listing_url.split("?")[0]
+                    if auction_prefix in completed_auctions:
+                        continue
+
+                n_pages += 1
+                try:
+                    html = self.fetch(listing_url)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] echec fetch listing %s : %s",
+                        self.source_nom, listing_url, e,
+                    )
+                    continue
+
+                is_index = (
+                    "/auctions" in listing_url
+                    and "/a/" not in listing_url
+                )
+
+                if is_index:
+                    # Memoize auction URLs (side-effect de parse_listing)
+                    for _ in self.parse_listing(html, listing_url):
+                        pass
+                    continue
+
+                # Page auction : lazy-load Airtable dedup une fois
+                if self._existing_urls is None:
+                    try:
+                        self._existing_urls = airtable_client.get_existing_urls(
+                            self.source_nom,
+                        )
+                        logger.info(
+                            "[%s] %d URLs deja en Airtable (skip)",
+                            self.source_nom, len(self._existing_urls),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] echec get_existing_urls : %s",
+                            self.source_nom, e,
+                        )
+                        self._existing_urls = set()
+
+                parsed = self._parse_auction_json(html, listing_url)
+
+                if parsed is None:
+                    # JSON cassé -> fallback pipeline standard
+                    for detail_url in self.parse_listing(html, listing_url):
+                        if detail_url in seen_urls:
+                            continue
+                        seen_urls.add(detail_url)
+                        n_fallback_lots += 1
+                        try:
+                            html_detail = self.fetch(detail_url)
+                            raw = self.parse_detail(html_detail, detail_url)
+                            yield self.normalize(raw, detail_url)
+                            n_yielded += 1
+                        except Exception as e:
+                            status_code = getattr(
+                                getattr(e, "response", None),
+                                "status_code", None,
+                            )
+                            if status_code == 500:
+                                logger.info(
+                                    "[%s] 500 sur %s (skip)",
+                                    self.source_nom, detail_url,
+                                )
+                            else:
+                                logger.warning(
+                                    "[%s] echec fallback %s : %s",
+                                    self.source_nom, detail_url, e,
+                                )
+                    continue
+
+                lots_json, has_next, total_size = parsed
+                logger.info(
+                    "[%s] %s : %d lots / totalSize=%d / hasNext=%s",
+                    self.source_nom, listing_url,
+                    len(lots_json), total_size, has_next,
+                )
+
+                for lot in lots_json:
+                    raw, lot_url = self._lot_to_raw(lot)
+                    if not raw or not lot_url:
+                        continue
+                    if lot_url in seen_urls:
+                        continue
+                    seen_urls.add(lot_url)
+                    n_lots_from_json += 1
+                    if lot_url in self._existing_urls:
+                        continue
+                    try:
+                        yield self.normalize(raw, lot_url)
+                        n_yielded += 1
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] echec normalize %s : %s",
+                            self.source_nom, lot_url, e,
+                        )
+
+                # Early stop si plus de pages pour cette auction
+                if not has_next and "/a/" in listing_url:
+                    auction_prefix = listing_url.split("?")[0]
+                    completed_auctions.add(auction_prefix)
+        finally:
+            logger.info(
+                "[%s] run() recap : pages=%d | from_json=%d | "
+                "fallback_lots=%d | yielded=%d | completed_auctions=%d",
+                self.source_nom, n_pages, n_lots_from_json,
+                n_fallback_lots, n_yielded, len(completed_auctions),
+            )
