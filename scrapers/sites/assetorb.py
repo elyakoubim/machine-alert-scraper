@@ -35,6 +35,7 @@ dans une des 8 categories Faillink officielles.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import re
 from typing import Iterator, Optional
@@ -99,7 +100,10 @@ LOCATION_PATTERN = re.compile(
 
 # Limites de sécurité
 MAX_AUCTIONS = 50           # Nb max auctions decouvertes
-# Pas de pagination interne sur les pages auction d'AssetOrb (tous lots affiches)
+# Pagination interne via ?pn=N : observe jusqu'a 4 pages sur au=731 (348 lots).
+# 10 est un garde-fou anti-runaway, l'early-stop sur page vide arrete plus tot.
+# Note : ?pp=N (override page size) est IGNORE par AssetOrb, seul pn fonctionne.
+MAX_PAGES_PER_AUCTION = 10
 
 
 class AssetOrbScraper(BaseScraper):
@@ -151,7 +155,11 @@ class AssetOrbScraper(BaseScraper):
             return
 
         for auction_url in self._auction_urls[:MAX_AUCTIONS]:
-            yield auction_url
+            # Paginate ?pn=1..MAX_PAGES_PER_AUCTION. L'early-stop sur page vide
+            # (cf. run()) arrete avant MAX si l'auction a moins de pages.
+            for page_num in range(1, MAX_PAGES_PER_AUCTION + 1):
+                sep = "&" if "?" in auction_url else "?"
+                yield f"{auction_url}{sep}pn={page_num}"
 
     def parse_listing(
         self, html: str, listing_url: str
@@ -356,3 +364,256 @@ class AssetOrbScraper(BaseScraper):
         if not text:
             return ""
         return re.sub(r"\s+", " ", text).strip()
+
+    # ================================================================
+    # Mode hybride niveau 2 : extraction depuis <div class='auction-lot'>
+    # ================================================================
+
+    def _iter_lots_from_html(
+        self, html: str, listing_url: str,
+    ) -> Iterator[tuple]:
+        """Parse les blocs <div class='auction-lot'> et yield (raw_dict, url).
+
+        Yield rien si aucun bloc trouve. Le caller decide quoi faire :
+        sur pn=1, fallback regex+niveau 3 ; sur pn>1, c'est la fin de pagination.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        lots = soup.select("div.auction-lot")
+        if not lots:
+            return
+
+        # Detect type_vente une fois pour toute la page
+        type_vente = "Industrieauktion"
+        html_lower = html.lower()
+        if "insolvenz" in html_lower:
+            type_vente = "Insolvenzversteigerung"
+        elif "werksschließung" in html_lower or "werksschlieung" in html_lower:
+            type_vente = "Werksschliessung"
+        elif "betriebsauflösung" in html_lower or "betriebsauflsung" in html_lower:
+            type_vente = "Betriebsauflösung"
+
+        logger.info(
+            "[%s] %s : %d lots dans le DOM (type_vente=%s)",
+            self.source_nom, listing_url, len(lots), type_vente,
+        )
+
+        for lot_div in lots:
+            raw, url = self._lot_block_to_raw(lot_div, type_vente)
+            if raw and url:
+                yield raw, url
+
+    def _lot_block_to_raw(self, lot_div, type_vente: str) -> tuple:
+        """Extrait (raw_dict, url) d'un seul bloc <div class='auction-lot'>.
+
+        Retourne (None, None) si le bloc est mal-forme.
+        """
+        details_url = (lot_div.get("data-detailsurl") or "").strip()
+        if not details_url:
+            link = lot_div.select_one("a[href*='/auction/lot/']")
+            if link:
+                details_url = (link.get("href") or "").strip()
+        if not details_url:
+            return None, None
+        details_url = details_url.replace("&amp;", "&")
+        url = (
+            BASE_URL + details_url if details_url.startswith("/")
+            else details_url
+        )
+
+        # Titre : .lot-title est le selector stable
+        titre = ""
+        for sel in [".lot-title", ".auction-lot-title", "h3", "h4"]:
+            el = lot_div.select_one(sel)
+            if el:
+                txt = self.clean_text(el.get_text(" "))
+                if txt:
+                    titre = txt
+                    break
+
+        # Image : <img src> direct (thumbnail "-small")
+        image_url = ""
+        img = lot_div.select_one("img")
+        if img:
+            image_url = (img.get("src") or img.get("data-src") or "").strip()
+
+        # Prix : Aktuelles Gebot en priorite, fallback Startpreis
+        full_text = lot_div.get_text(" ", strip=True)
+        prix = ""
+        for kw in ("Aktuelles Gebot", "Höchstgebot", "Mindestgebot",
+                   "Startpreis", "Schätzpreis"):
+            pattern = re.compile(
+                rf"{re.escape(kw)}[\s:]*€\s*([\d.,]+)",
+                re.IGNORECASE,
+            )
+            m = pattern.search(full_text)
+            if m:
+                prix = f"EUR {m.group(1)}"
+                break
+
+        # date_fin via data-endtime epoch UTC → ISO 8601
+        date_fin = None
+        end_epoch_raw = lot_div.get("data-endtime")
+        if end_epoch_raw:
+            try:
+                ep = int(end_epoch_raw)
+                if ep > 0:
+                    date_fin = datetime.fromtimestamp(
+                        ep, tz=timezone.utc,
+                    ).isoformat()
+            except (ValueError, TypeError):
+                pass
+
+        # source_id : "{auctionId}-{lotId}"
+        source_id = ""
+        lot_id = lot_div.get("data-id")
+        au_match = re.search(r"au=(\d+)", details_url)
+        if lot_id and au_match:
+            source_id = f"{au_match.group(1)}-{lot_id}"
+        elif lot_id:
+            source_id = str(lot_id)
+
+        raw = {
+            "titre": titre,
+            "description": "",  # Niveau 2 n'expose pas description (accepté)
+            "prix": prix,
+            "image_url": image_url,
+            "type_vente": type_vente,
+            "categorie_native": None,
+            "source_id": source_id,
+            "date_fin": date_fin,
+        }
+        return raw, url
+
+    def run(self) -> Iterator[Annonce]:
+        """Mode hybride niveau 2 : parse les lots depuis <div.auction-lot>
+        sur les pages d'auction, evitant de fetcher chaque page lot.
+
+        - Page /upcoming-auctions : memoize auction URLs (inchangé).
+        - Page /auction/details/?...&pn=N : extraction directe via DOM.
+        - Pagination ?pn=1..MAX avec early-stop quand une page yield 0 lots
+          (= fin de pagination atteinte). Auction marquee 'completed' pour
+          skip les pages restantes.
+        - Fallback regex + niveau 3 seulement si pn=1 yield 0 lots (signal
+          de schema cassé). Sur pn>1, 0 lot = fin normale.
+        """
+        seen_urls: set = set()
+        completed_auctions: set = set()
+        n_pages = 0
+        n_lots_from_html = 0
+        n_fallback_lots = 0
+        n_yielded = 0
+        try:
+            for listing_url in self.list_listing_urls():
+                # Early-stop : skip les pages d'une auction deja terminee
+                auction_prefix = (
+                    listing_url.split("&pn=")[0]
+                    if "&pn=" in listing_url else listing_url
+                )
+                if auction_prefix in completed_auctions:
+                    continue
+
+                n_pages += 1
+                try:
+                    html = self.fetch(listing_url)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] echec fetch listing %s : %s",
+                        self.source_nom, listing_url, e,
+                    )
+                    continue
+
+                is_index = "/upcoming-auctions" in listing_url
+                is_auction_page = "/auction/details/" in listing_url
+
+                if is_index:
+                    for _ in self.parse_listing(html, listing_url):
+                        pass
+                    continue
+
+                if not is_auction_page:
+                    continue
+
+                # Lazy-load Airtable dedup une fois
+                if self._existing_urls is None:
+                    try:
+                        self._existing_urls = airtable_client.get_existing_urls(
+                            self.source_nom,
+                        )
+                        logger.info(
+                            "[%s] %d URLs deja en Airtable (skip)",
+                            self.source_nom, len(self._existing_urls),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] echec get_existing_urls : %s",
+                            self.source_nom, e,
+                        )
+                        self._existing_urls = set()
+
+                # Extraction hybride
+                n_before = n_lots_from_html
+                for raw, lot_url in self._iter_lots_from_html(html, listing_url):
+                    n_lots_from_html += 1
+                    if lot_url in seen_urls:
+                        continue
+                    seen_urls.add(lot_url)
+                    if lot_url in self._existing_urls:
+                        continue
+                    try:
+                        yield self.normalize(raw, lot_url)
+                        n_yielded += 1
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] echec normalize %s : %s",
+                            self.source_nom, lot_url, e,
+                        )
+
+                page_had_lots = (n_lots_from_html > n_before)
+
+                # Early-stop : si la page yield 0 lots, l'auction est terminee.
+                # On marque pour skip les pn=N+1, N+2... suivants.
+                if not page_had_lots:
+                    completed_auctions.add(auction_prefix)
+                    # Fallback regex+niveau 3 SEULEMENT sur pn=1 (1ère page).
+                    # Sur pn>1, 0 lot = fin de pagination normale, pas un bug.
+                    is_first_page = (
+                        "&pn=1" in listing_url
+                        and "&pn=10" not in listing_url
+                    )
+                    if is_first_page:
+                        logger.warning(
+                            "[%s] %s : 0 lot via <div.auction-lot>, fallback regex+niveau 3",
+                            self.source_nom, listing_url,
+                        )
+                        for detail_url in self.parse_listing(html, listing_url):
+                            if detail_url in seen_urls:
+                                continue
+                            seen_urls.add(detail_url)
+                            n_fallback_lots += 1
+                            try:
+                                html_detail = self.fetch(detail_url)
+                                raw = self.parse_detail(html_detail, detail_url)
+                                yield self.normalize(raw, detail_url)
+                                n_yielded += 1
+                            except Exception as e:
+                                status_code = getattr(
+                                    getattr(e, "response", None),
+                                    "status_code", None,
+                                )
+                                if status_code == 500:
+                                    logger.info(
+                                        "[%s] 500 sur %s (skip)",
+                                        self.source_nom, detail_url,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[%s] echec fallback %s : %s",
+                                        self.source_nom, detail_url, e,
+                                    )
+        finally:
+            logger.info(
+                "[%s] run() recap : pages=%d | from_html=%d | "
+                "fallback_lots=%d | yielded=%d | completed_auctions=%d",
+                self.source_nom, n_pages, n_lots_from_html,
+                n_fallback_lots, n_yielded, len(completed_auctions),
+            )
