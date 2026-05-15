@@ -41,9 +41,13 @@ PROFILS_TABLE = os.getenv("AIRTABLE_PROFILS_TABLE", "tblXhuS0M1TtRuSel")
 API_BASE = f"https://api.airtable.com/v0/{BASE_ID}"
 HTTP_TIMEOUT = 20.0
 
-# Garde-fou anti boucle infinie pour list_all_annonces (200 pages * 100 = 20k records,
-# headroom confortable sur la base actuelle ~16k).
-MAX_PAGES = 200
+# Garde-fou anti boucle infinie pour list_all_annonces.
+# MAX_PAGES * 100 records/page = plafond dur. 1000 pages = 100k records,
+# donne ~12 mois de runway au rythme actuel (base ~34k au 2026-05-15 apres
+# premier scrape Surplex hybride). Au-dessus = raise (vraie anomalie).
+# WARN_PAGES declenche un log WARNING preventif pour anticiper l'echeance.
+MAX_PAGES = 1000
+WARN_PAGES = 500
 
 
 def _headers() -> dict:
@@ -241,6 +245,12 @@ def list_all_annonces(
     page = 0
     while True:
         page += 1
+        if page == WARN_PAGES:
+            logger.warning(
+                "[airtable] list_all_annonces : %d pages atteintes (~%d records) — "
+                "plafond MAX_PAGES=%d, prevoir augmentation si croissance continue",
+                page, len(all_records), MAX_PAGES,
+            )
         if page > MAX_PAGES:
             raise RuntimeError(
                 f"list_all_annonces : MAX_PAGES={MAX_PAGES} depasse "
