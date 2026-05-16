@@ -268,11 +268,18 @@ class BaseScraper(ABC):
         )
         source_id = raw.get("source_id") or _source_id_from_url(url)
 
+        # pays : preference raw["pays"] (scrapers multi-pays comme Surplex/NetBid
+        # extraient le pays reel par lot), fallback self.source_pays (default
+        # single-country pour Auctelia/Hämmerle/etc.). Annonce.validate() rejette
+        # tout non-conforme ISO-2 lettres.
+        pays_raw = (raw.get("pays") or "").strip().upper()
+        pays = pays_raw if pays_raw else self.source_pays
+
         annonce = Annonce(
             url=url,
             titre=titre,
             source_nom=self.source_nom,
-            pays=self.source_pays,
+            pays=pays,
             description=description,
             prix=prix,
             image_url=image_url,
