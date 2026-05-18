@@ -337,10 +337,8 @@ def build_alert_email_html(client: dict, top_n: list, total_count: int) -> str:
   {extras_block}
 
   <p style="color: #999; font-size: 12px; margin-top: 32px;">
-    Faillink — Alertes B2B sur machines industrielles off-market en Europe<br>
-    <a href="https://app.faillink.be/preferences" style="color: #999;">Gérer mes préférences</a>
-    &nbsp;·&nbsp;
-    <a href="https://app.faillink.be/unsubscribe" style="color: #999;">Se désinscrire</a>
+    Faillink — Alertes B2B sur opportunités off-market en Europe<br>
+    <a href="https://app.faillink.be/mon-compte" style="color: #999;">Gérer mes préférences</a>
   </p>
 
 </body>

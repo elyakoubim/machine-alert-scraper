@@ -274,7 +274,7 @@ def send_email_essai_simple(
 
   <h1 style="color: #1a1a1a;">Bonjour {to_name or 'cher entrepreneur'},</h1>
 
-  <p>Merci pour votre intérêt pour Faillink. Voici un aperçu de notre flux d'alertes machines off-market en Europe.</p>
+  <p>Merci pour votre intérêt pour Faillink. Voici un aperçu de notre flux d'alertes off-market en Europe.</p>
 
   <div style="background: #f0f4ff; padding: 16px; border-radius: 8px; margin: 16px 0;">
     <strong>Votre profil :</strong><br>
@@ -294,13 +294,13 @@ def send_email_essai_simple(
   <div style="margin-top: 32px; padding: 24px; background: #1a1a1a; color: white; border-radius: 8px; text-align: center;">
     <h3 style="margin: 0 0 12px 0;">Envie de l'accès complet ?</h3>
     <p style="margin: 0 0 16px 0;">Marque, modèle, prix, lien direct vers la source, alertes en temps réel.</p>
-    <a href="https://faillink.be/machine-alert/" style="display: inline-block; background: #ffaa00; color: #1a1a1a; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600;">
+    <a href="https://faillink.be/tarifs-services-faillites-entreprises-belgique/" style="display: inline-block; background: #ffaa00; color: #1a1a1a; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600;">
       Voir les abonnements
     </a>
   </div>
 
   <p style="color: #999; font-size: 12px; margin-top: 32px;">
-    Faillink — Alertes B2B sur machines industrielles off-market en Europe<br>
+    Faillink — Alertes B2B sur opportunités off-market en Europe<br>
     Vous recevez cet email car vous avez demandé un essai sur faillink.be
   </p>
 
@@ -319,7 +319,7 @@ def send_email_essai_simple(
             json={
                 "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
                 "to": [{"email": to_email, "name": to_name or to_email}],
-                "subject": "🔔 Votre aperçu Faillink — 5 alertes machines off-market",
+                "subject": "🔔 Votre aperçu Faillink — 5 opportunités off-market",
                 "htmlContent": html_content,
             },
             timeout=15,
@@ -389,7 +389,7 @@ def build_payment_failed_email_html(
   </div>
 
   <p style="color: #999; font-size: 12px; margin-top: 32px;">
-    Faillink — Alertes B2B sur machines industrielles off-market en Europe<br>
+    Faillink — Alertes B2B sur opportunités off-market en Europe<br>
     Vous recevez cet email suite à un échec de paiement de votre abonnement.
   </p>
 
