@@ -401,15 +401,25 @@ class BaseScraper(ABC):
             time.sleep(self.rate_limit_seconds - elapsed)
 
 
+_ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
 def _iso_or_none(s) -> Optional[str]:
     if not s:
         return None
     if isinstance(s, datetime):
         dt = s
     else:
+        s_str = str(s)
+        # ISO 8601 (YYYY-MM-DD...) doit etre parse avec dayfirst=False : sinon
+        # dateutil swap MM<->DD des que jour <= 12 (ex: '2026-06-09' devient
+        # 9 juin -> 6 septembre). Pour les formats europeens (DD/MM/YYYY,
+        # DD-MM-YYYY) on garde dayfirst=True : c'est ce que produisent
+        # Auctelia, Restlos, Legalbrokers et autres scrapers EU.
+        is_iso = bool(_ISO_DATE_PREFIX.match(s_str))
         try:
             from dateutil import parser as dateparser
-            dt = dateparser.parse(str(s), dayfirst=True, fuzzy=True)
+            dt = dateparser.parse(s_str, dayfirst=not is_iso, fuzzy=True)
         except Exception:
             return None
     if dt.tzinfo is None:
