@@ -50,9 +50,11 @@ Exit codes :
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
-from datetime import date, datetime, timedelta
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -89,10 +91,16 @@ DEFAULT_SOURCES = (
 # Justification :
 #   - past=7  : un lot peut etre indexe legerement apres sa cloture si le
 #               scraper tournait en retard ; au-dela c'est tres improbable.
-#   - future=180 : Auctions Surplex/IVG durent jusqu'a ~30 jours, on prend
-#               large pour les rares cas de planning long terme.
+#   - future=60 : empiriquement sur le dry-run global (25 893 records),
+#               la distribution des date_fin reelles plafonne a ~p90=25j
+#               apres indexed_at (median=20j). Les valeurs entre 60-180j
+#               sont quasi exclusivement des dates swappees (jour reel +
+#               4-6 mois). Avec FUTURE=60 on disambigue 99% des cas
+#               (2538/2558 ambigus deviennent SWAP automatiques). Les 20
+#               restants sont 18 palindromes 7/7 (swap == old) + 2 vrais
+#               ambigus IVG a auditer a la main.
 PLAUSIBLE_PAST_DAYS = 7
-PLAUSIBLE_FUTURE_DAYS = 180
+PLAUSIBLE_FUTURE_DAYS = 60
 
 
 def parse_date(s: Optional[str]) -> Optional[date]:
@@ -174,6 +182,12 @@ def classify_record(date_fin_str: Optional[str], indexed_at_str: Optional[str]) 
             "reason": "ni old ni swap plausibles vs indexed_at"}
 
 
+def write_jsonl(path: Path, items: list) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False, default=str) + "\n")
+
+
 def fetch_candidates(sources: tuple, limit: Optional[int]) -> list:
     """Fetch les annonces a auditer depuis Airtable."""
     src_clause = ",".join([f"{{source}}='{s}'" for s in sources])
@@ -227,6 +241,10 @@ def main() -> int:
                         help="limite le nombre de records audites (test)")
     parser.add_argument("--verbose", action="store_true",
                         help="log chaque decision (SKIP / SWAP / INVALID)")
+    parser.add_argument("--audit-output", type=Path, default=None,
+                        help="dump JSONL de TOUTES les decisions (dry-run "
+                             "et execute). Utile pour analyse posterieure "
+                             "des SKIP-AMBIGUOUS. Defaut : pas de dump.")
     args = parser.parse_args()
 
     if args.execute:
@@ -254,6 +272,7 @@ def main() -> int:
             "id": rec["id"],
             "source": f.get("source"),
             "indexed_at": f.get("indexed_at"),
+            "url": f.get("url"),
             **decision,
         }
         decisions.append(item)
@@ -306,6 +325,11 @@ def main() -> int:
         pct = (100 * b["swap"] / b["total"]) if b["total"] else 0
         print(f"  {s:<14} {b['total']:>7} {b['swap']:>7} {b['skip_ok']:>9} {pct:>6.1f}%")
 
+    # Dump audit (optionnel en dry-run, utile pour analyser SKIP-AMBIGUOUS)
+    if args.audit_output:
+        write_jsonl(args.audit_output, decisions)
+        logger.info("Audit JSONL dumpe dans %s", args.audit_output)
+
     if args.dry_run:
         print()
         print("DRY-RUN : aucun PATCH applique. Relancer avec --execute pour patcher.")
@@ -320,14 +344,44 @@ def main() -> int:
     if not updates:
         logger.info("Rien a patcher (0 SWAP). Exit.")
         return 0
+
+    # ROLLBACK LOG OBLIGATOIRE avant le PATCH. Si le execute crashe a mi-
+    # chemin, on peut rejouer date_fin_old depuis ce JSONL. Path : %TEMP%/
+    # backfill_date_fin_rollback_<sources>_<timestamp>.jsonl
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    src_tag = "-".join(sources)[:40]
+    rollback_path = Path(tempfile.gettempdir()) / (
+        f"backfill_date_fin_rollback_{src_tag}_{ts}.jsonl"
+    )
+    rollback_rows = [
+        {
+            "id": d["id"],
+            "source": d["source"],
+            "url": d.get("url"),
+            "indexed_at": d["indexed_at"],
+            "date_fin_old": d["old"],
+            "date_fin_new": d["new"],
+            "action": d["action"],
+            "ts_utc": ts,
+        }
+        for d in swap_items
+    ]
+    write_jsonl(rollback_path, rollback_rows)
+    logger.info("ROLLBACK LOG ecrit : %s (%d records)",
+                rollback_path, len(rollback_rows))
+    logger.info("  -> en cas de desastre : pour chaque ligne, PATCH "
+                "date_fin = date_fin_old via airtable.batch_update_annonces.")
+
     logger.info("EXECUTE : %d PATCH en cours (batch 10, throttle 250ms)...",
                 len(updates))
     try:
         result = airtable.batch_update_annonces(updates)
     except Exception as e:
         logger.error("batch_update_annonces KO : %s", e)
+        logger.error("Rollback log dispo : %s", rollback_path)
         return 3
     logger.info("Result : %s", result)
+    logger.info("Rollback log : %s", rollback_path)
     errors = result.get("errors", 0) if isinstance(result, dict) else 0
     return 2 if errors else 0
 
